@@ -1,0 +1,57 @@
+{
+  "servers": {
+    "blender": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--python", "3.11", "mcp-for-blender"],
+      "env": {
+        "UV_PYTHON_PREFERENCE": "only-managed",
+        "BLENDER_HOST": "localhost",
+        "BLENDER_PORT": "9876",
+        "DISABLE_TELEMETRY": "true"
+      }
+    },
+    "unity": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "mcpforunityserver", "mcp-for-unity", "--transport", "stdio"]
+    },
+    "comfyui": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--with", "mcp<2", "--from", "mcp-comfyui", "comfyui-mcp"],
+      "env": {
+        "COMFYUI_URL": "http://127.0.0.1:8188"
+      }
+    },
+    "filesystem": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "c:\\projects\\EchoCradle"
+      ]
+    },
+    "git": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-server-git", "--repository", "c:\\projects\\EchoCradle"]
+    },
+    "memory": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"]
+    },
+    "sequential-thinking": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+    },
+    "fetch": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-server-fetch"]
+    }
+  }
+}

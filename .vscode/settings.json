@@ -1,0 +1,45 @@
+{
+    "files.exclude": {
+        "**/Library": true,
+        "**/Temp": true,
+        "**/Obj": true,
+        "**/Build": true,
+        "**/Builds": true,
+        "**/Logs": true,
+        "**/UserSettings": true,
+        "**/node_modules": true,
+        "**/__pycache__": true,
+        "**/.venv": true
+    },
+    "search.exclude": {
+        "**/Library": true,
+        "**/Temp": true,
+        "**/Build": true,
+        "**/Builds": true,
+        "**/node_modules": true,
+        "**/*.meta": true
+    },
+    "files.associations": {
+        "*.asmdef": "json",
+        "*.asmref": "json",
+        "*.shader": "shaderlab",
+        "*.compute": "hlsl",
+        "*.hlsl": "hlsl"
+    },
+    "editor.formatOnSave": true,
+    "editor.rulers": [
+        100
+    ],
+    "[csharp]": {
+        "editor.defaultFormatter": "ms-dotnettools.csharp",
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true
+    },
+    "[python]": {
+        "editor.tabSize": 4
+    },
+    "dotnet.defaultSolution": "Unity/EchoCradle.sln",
+    "python.analysis.extraPaths": [],
+    "git.autofetch": true,
+    "git.confirmSync": false
+}
