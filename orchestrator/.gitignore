@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Local model store is NOT here — it lives in %LOCALAPPDATA%\EchoCradle
+# (see orchestrator/paths.py). Nothing model-related should be committed.
+
+# Generated audio from manual smoke tests — never commit these.
+out/
+*.wav

@@ -172,6 +172,7 @@ Rough plan refined with the experiments in `experiments/`. Cross-cutting decisio
 | Speech | **Kokoro-82M** (CPU), Piper (MIT, CPU) fallback | [0104](../../experiments/audio-generation/0104-audio-model-selection/README.md) |
 | Streaming speech | **sherpa-onnx** (TTS + online ASR); Piper/Kokoro TTS; faster-whisper final STT | [0109](../../experiments/audio-generation/0109-streaming-tts-stt/README.md) |
 | VRAM probing | **NVML/`pynvml`** with an `nvidia-smi` fallback; measure **delta of device `used`** | [0105](../../experiments/benchmarks/0105-vram-probe-residency/README.md) |
+| Tool calling | **Split persona from extraction**; native `tools` + `--jinja` | [introduction-test-tts-sst](../../experiments/llm-runtimes/introduction-test-tts-sst/README.md) |
 
 Per-modality detail (model families, sizes, licences, fallbacks) lives in the
 sibling files: [`text.md`](text.md), [`image.md`](image.md), [`three-d.md`](three-d.md),
@@ -213,6 +214,21 @@ sibling files: [`text.md`](text.md), [`image.md`](image.md), [`three-d.md`](thre
    Whisper is chunked and lags by a full chunk. Both run on **CPU**, so voice I/O
    costs zero VRAM and works on Tier 0. The LLM→TTS bridge is a **sentence
    splitter**, not a model. (exp. 0109)
+10. **Tool calling fails from instruction competition, not model size.** A prompt
+    that asks a model to hold a persona, follow a multi-step agenda *and* decide
+    when to call a tool makes it do none of them reliably. Splitting the turn
+    into an **extraction** call (no persona, no agenda) and a **persona** call
+    (no tools) took the same model from 1/3 to 4/4 tool calls. Model choice
+    still matters — prefer 2025–2026 models over 2024 ones — but prompt
+    structure dominates. (introduction-test-tts-sst)
+11. **A host must release its subprocesses.** A leaked `llama-server` holds
+    VRAM and makes the planner refuse models that previously fit. Hosts need an
+    explicit `unload()` *and* a destructor safety net, and callers must always
+    stop the orchestrator. (introduction-test-tts-sst)
+12. **Reasoning models need thinking disabled for short turns.** Granite 4.2 and
+    Qwen3 spend the whole token budget on hidden reasoning and return empty
+    `content` unless `enable_thinking: false` is passed. The catalog records this
+    per model. (introduction-test-tts-sst)
 
 ---
 

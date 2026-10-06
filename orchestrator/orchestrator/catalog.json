@@ -1,0 +1,332 @@
+{
+    "version": 1,
+    "comment": "Open-weight models only. vram_gb is the PEAK footprint, not download size. tier = lowest machine tier that runs it comfortably. All URLs verified 2026-09-30.",
+    "models": [
+        {
+            "id": "qwen2.5-1.5b-instruct-q4km",
+            "modality": "text",
+            "family": "Qwen2.5",
+            "tier": 0,
+            "quality": 0.55,
+            "license": "Apache-2.0",
+            "shippable": true,
+            "url": "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+            "size_gb": 1.04,
+            "vram_gb": 2.2,
+            "ram_gb": 2.2,
+            "single_file": true,
+            "params": {
+                "context": 4096
+            },
+            "notes": "Tier 0 default. Runs on CPU. Good enough for short structured replies."
+        },
+        {
+            "id": "qwen2.5-3b-instruct-q4km",
+            "modality": "text",
+            "family": "Qwen2.5",
+            "tier": 1,
+            "quality": 0.68,
+            "license": "Apache-2.0",
+            "shippable": true,
+            "url": "https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+            "size_gb": 1.8,
+            "vram_gb": 3.6,
+            "ram_gb": 3.6,
+            "single_file": true,
+            "params": {
+                "context": 4096
+            },
+            "notes": "Tier 1 default."
+        },
+        {
+            "id": "qwen2.5-7b-instruct-q4km",
+            "modality": "text",
+            "family": "Qwen2.5",
+            "tier": 2,
+            "quality": 0.82,
+            "license": "Apache-2.0",
+            "shippable": true,
+            "url": "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+            "size_gb": 4.36,
+            "vram_gb": 6.5,
+            "ram_gb": 6.5,
+            "single_file": true,
+            "params": {
+                "context": 8192
+            },
+            "notes": "Tier 2 default. The usual dialogue sweet spot."
+        },
+        {
+            "id": "granite-4.2-3b-q4km",
+            "modality": "text",
+            "family": "Granite 4.2",
+            "tier": 1,
+            "quality": 0.7,
+            "license": "Apache-2.0",
+            "shippable": true,
+            "url": "https://huggingface.co/ibm-granite/granite-4.2-3b-GGUF/resolve/main/granite-4.2-3b-Q4_K_M.gguf",
+            "size_gb": 2.1,
+            "vram_gb": 3.8,
+            "ram_gb": 3.8,
+            "single_file": true,
+            "params": {
+                "context": 8192,
+                "enable_thinking": false
+            },
+            "notes": "Tier 1. Native tool calling, but no agentic RL block. Reasoning model: needs enable_thinking=false or a large token budget."
+        },
+        {
+            "id": "granite-4.2-8b-q4km",
+            "modality": "text",
+            "family": "Granite 4.2",
+            "tier": 2,
+            "quality": 0.88,
+            "license": "Apache-2.0",
+            "shippable": true,
+            "url": "https://huggingface.co/ibm-granite/granite-4.2-8b-GGUF/resolve/main/granite-4.2-8b-Q4_K_M.gguf",
+            "size_gb": 5.1,
+            "vram_gb": 7.5,
+            "ram_gb": 7.5,
+            "single_file": true,
+            "params": {
+                "context": 8192,
+                "enable_thinking": false
+            },
+            "notes": "Tier 2 default. Agentic-RL trained; best 8B for tool use. Reasoning model: needs enable_thinking=false or a large token budget."
+        },
+        {
+            "id": "qwen3-8b-q4km",
+            "modality": "text",
+            "family": "Qwen3",
+            "tier": 2,
+            "quality": 0.82,
+            "license": "Apache-2.0",
+            "shippable": true,
+            "url": "https://huggingface.co/unsloth/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf",
+            "size_gb": 4.68,
+            "vram_gb": 7.0,
+            "ram_gb": 7.0,
+            "single_file": true,
+            "params": {
+                "context": 8192,
+                "enable_thinking": false
+            },
+            "notes": "Tier 2. BFCL v4 42.57 - beats Llama-3.3-70B. XML-style tool calls supported by llama.cpp."
+        },
+        {
+            "id": "qwen2.5-14b-instruct-q4km",
+            "modality": "text",
+            "family": "Qwen2.5",
+            "tier": 3,
+            "quality": 0.84,
+            "license": "Apache-2.0",
+            "shippable": true,
+            "url": "https://huggingface.co/bartowski/Qwen2.5-14B-Instruct-GGUF/resolve/main/Qwen2.5-14B-Instruct-Q4_K_M.gguf",
+            "size_gb": 8.37,
+            "vram_gb": 11.5,
+            "ram_gb": 11.5,
+            "single_file": true,
+            "params": {
+                "context": 8192
+            },
+            "notes": "Tier 3. Good prose, but a 2024 model with weak tool-calling post-training; prefer Granite 4.2-8B for agentic work."
+        },
+        {
+            "id": "piper-en-amy-low",
+            "modality": "tts",
+            "family": "Piper VITS",
+            "tier": 0,
+            "quality": 0.6,
+            "license": "MIT",
+            "shippable": true,
+            "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-amy-low.tar.bz2",
+            "size_gb": 0.0625,
+            "ram_gb": 0.2,
+            "files": [
+                "en_US-amy-low.onnx",
+                "tokens.txt",
+                "espeak-ng-data"
+            ],
+            "params": {
+                "model_file": "en_US-amy-low.onnx",
+                "tokens": "tokens.txt",
+                "data_dir": "espeak-ng-data",
+                "sample_rate": 16000,
+                "num_speakers": 1
+            },
+            "notes": "Tier 0 default voice. Small, fast, CPU-only."
+        },
+        {
+            "id": "piper-en-lessac-medium",
+            "modality": "tts",
+            "family": "Piper VITS",
+            "tier": 0,
+            "quality": 0.72,
+            "license": "MIT",
+            "shippable": true,
+            "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-lessac-medium.tar.bz2",
+            "size_gb": 0.0626,
+            "ram_gb": 0.25,
+            "files": [
+                "en_US-lessac-medium.onnx",
+                "tokens.txt",
+                "espeak-ng-data"
+            ],
+            "params": {
+                "model_file": "en_US-lessac-medium.onnx",
+                "tokens": "tokens.txt",
+                "data_dir": "espeak-ng-data",
+                "sample_rate": 22050,
+                "num_speakers": 1
+            },
+            "notes": "Clearer English voice, same size class as amy-low."
+        },
+        {
+            "id": "kokoro-en-v0_19",
+            "modality": "tts",
+            "family": "Kokoro",
+            "tier": 0,
+            "quality": 0.88,
+            "license": "Apache-2.0",
+            "shippable": true,
+            "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-en-v0_19.tar.bz2",
+            "size_gb": 0.298,
+            "ram_gb": 0.8,
+            "files": [
+                "model.onnx",
+                "voices.bin",
+                "tokens.txt",
+                "espeak-ng-data"
+            ],
+            "params": {
+                "model_file": "model.onnx",
+                "tokens": "tokens.txt",
+                "data_dir": "espeak-ng-data",
+                "voices": "voices.bin",
+                "sample_rate": 24000,
+                "num_speakers": 11
+            },
+            "notes": "Best quality/price. 11 English voices via speaker id."
+        },
+        {
+            "id": "sensevoice-small",
+            "modality": "stt",
+            "family": "SenseVoice (offline)",
+            "tier": 0,
+            "quality": 0.95,
+            "license": "Apache-2.0 (weights: FunASR model licence)",
+            "shippable": false,
+            "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
+            "size_gb": 0.229,
+            "ram_gb": 1.2,
+            "files": [
+                "model.int8.onnx",
+                "tokens.txt"
+            ],
+            "params": {
+                "kind": "sensevoice",
+                "model": "model.int8.onnx",
+                "tokens": "tokens.txt",
+                "sample_rate": 16000,
+                "language": "en"
+            },
+            "notes": "Best measured accuracy: 0% WER on real microphone recordings, 22% on synthesised speech. 21x realtime, only 229 MB. Marks `shippable: false` because the FunASR weights carry their own licence terms rather than Apache-2.0."
+        },
+        {
+            "id": "whisper-base-en",
+            "modality": "stt",
+            "family": "Whisper (offline)",
+            "tier": 0,
+            "quality": 0.9,
+            "license": "MIT",
+            "shippable": true,
+            "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-base.en.tar.bz2",
+            "size_gb": 0.278,
+            "ram_gb": 1.4,
+            "files": [
+                "base.en-encoder.onnx",
+                "base.en-decoder.onnx",
+                "base.en-tokens.txt"
+            ],
+            "params": {
+                "kind": "whisper",
+                "encoder": "base.en-encoder.onnx",
+                "decoder": "base.en-decoder.onnx",
+                "tokens": "base.en-tokens.txt",
+                "sample_rate": 16000,
+                "language": "en"
+            },
+            "notes": "Measured 10% WER, 18/20 exact on the fixed corpus. Use the FULL-precision weights: the int8 decoder loops ('I would I would I would'). Offline, so no partials."
+        },
+        {
+            "id": "zipformer-en-streaming",
+            "modality": "stt",
+            "family": "Zipformer (streaming)",
+            "tier": 0,
+            "quality": 0.85,
+            "license": "Apache-2.0",
+            "shippable": true,
+            "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2",
+            "size_gb": 0.310,
+            "ram_gb": 0.7,
+            "files": [
+                "encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
+                "decoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
+                "joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
+                "tokens.txt"
+            ],
+            "params": {
+                "kind": "zipformer-streaming",
+                "encoder": "encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
+                "decoder": "decoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
+                "joiner": "joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
+                "tokens": "tokens.txt",
+                "sample_rate": 16000
+            },
+            "notes": "Measured 23% WER, 16/20 exact. Emits partials, so the game can react while the player speaks (barge-in). Use alongside whisper-base-en for the final transcript."
+        },
+        {
+            "id": "zipformer-en-20m-streaming",
+            "modality": "stt",
+            "family": "Zipformer (streaming)",
+            "tier": 0,
+            "quality": 0.45,
+            "license": "Apache-2.0",
+            "shippable": true,
+            "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17.tar.bz2",
+            "size_gb": 0.119,
+            "ram_gb": 0.4,
+            "files": [
+                "encoder-epoch-99-avg-1.onnx",
+                "decoder-epoch-99-avg-1.onnx",
+                "joiner-epoch-99-avg-1.onnx",
+                "tokens.txt"
+            ],
+            "params": {
+                "encoder": "encoder-epoch-99-avg-1.onnx",
+                "decoder": "decoder-epoch-99-avg-1.onnx",
+                "joiner": "joiner-epoch-99-avg-1.onnx",
+                "tokens": "tokens.txt",
+                "sample_rate": 16000
+            },
+            "notes": "Legacy baseline: measured 78% WER, 0/20 exact. Kept only for comparison; prefer whisper-base-en or zipformer-en-streaming."
+        },
+        {
+            "id": "silero-vad",
+            "modality": "stt",
+            "family": "Silero VAD",
+            "tier": 0,
+            "quality": 0.0,
+            "license": "MIT",
+            "shippable": true,
+            "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
+            "size_gb": 0.0006,
+            "ram_gb": 0.05,
+            "single_file": true,
+            "params": {
+                "sample_rate": 16000
+            },
+            "notes": "Endpointing helper, not a recogniser. Optional."
+        }
+    ]
+}

@@ -64,9 +64,52 @@ residency control the scheduler needs. This is also what eliminated vLLM.
 
 ---
 
+## Tool calling
+
+Models may call **tools** mid-turn (read/write a JSON document, query state).
+The orchestrator exposes them in the OpenAI `tools` format, which llama.cpp
+understands, and executes the calls through a `ToolRegistry`.
+
+> **Finding (introduction-test-tts-sst).** Tool calling fails when the *same*
+> prompt also asks the model to hold a persona and follow a multi-step agenda.
+> Bisecting the system prompt showed each instruction is harmless alone but the
+> combination suppresses the call entirely — **instruction competition**, not a
+> capability wall.
+>
+> **Fix: split the work into two calls per turn.**
+>
+> 1. an **extraction** call with no persona and no agenda, which only decides
+>    what to record, and
+> 2. a **persona** call with no tools, which only decides what to say.
+>
+> Measured: Qwen2.5-7B combined prompt 0/3 calls; Granite 4.2-8B combined 1/3;
+> Granite 4.2-8B extraction-only **4/4**. The split costs no extra VRAM (two
+> calls to the same model) and lets the extraction step use a different or
+> smaller model later.
+>
+> **Model choice still matters, but less than prompt structure.** Qwen2.5 is a
+> 2024 model with weak tool-calling post-training; prefer 2025–2026 models
+> (Granite 4.2, Qwen3/3.5, Hermes 4). On BFCL v4, Qwen3-8B (42.6) beats
+> Llama-3.3-70B (31.9) — post-training dominates parameter count.
+
+### Practical notes
+
+- Start `llama-server` with `--jinja` so the model's own chat template (and
+  therefore native tool calling) is active.
+- **Reasoning models** (Granite 4.2, Qwen3) spend the whole token budget on
+  hidden reasoning and return empty `content` unless thinking is disabled. Pass
+  `chat_template_kwargs: {"enable_thinking": false}` for short turns.
+- Keep the KV cache at f16; llama.cpp documents that quantized KV degrades tool
+  calling.
+- Put tool definitions last (closest to generation) and keep the persona short.
+
+---
+
 ## Open questions
 
 | # | Question |
 |---|----------|
 | Q9 | Do in-process diffusers and llama.cpp actually co-exist inside the VRAM budget? |
 | — | Which family is the default per tier once benchmarked on more than the dev box? |
+| — | Does a dedicated extraction model (xLAM-2-3b, ToolACE-2-8B) beat a general model for the second call? |
+| — | Is the persona/extraction split still needed on a 14B+ model? |

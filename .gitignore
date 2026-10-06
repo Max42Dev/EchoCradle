@@ -68,3 +68,6 @@ desktop.ini
 .env.local
 *.secret
 credentials.json
+
+# Generated experiment output (TTS wavs, produced configs)
+experiments/**/out/

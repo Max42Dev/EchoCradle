@@ -1,0 +1,9 @@
+# Generated artifacts and local state — never commit these.
+out/
+*.wav
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
