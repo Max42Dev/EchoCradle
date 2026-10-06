@@ -28,6 +28,8 @@ which is where we validate *how* to build it.
 | --- | --- |
 | `vision.md` | High-level pitch, pillars, target experience, non-goals |
 | `architecture.md` | Unity + local AI runtime, process boundaries, data flow |
+| `configuration.md` | Configs (typed JSON) as the source of truth; Unity objects derived from them |
+| `git-state.md` | Git-backed save state: linear timeline, undo/redo, binary content, growth policy |
 | `world-generation.md` | Procedural + LLM-driven world, regions, biomes, lore |
 | `level-generation.md` | Layouts, dungeons, encounters, tilemap/terrain pipelines |
 | `narrative.md` | Quests, dialogue, factions, memory and continuity |
