@@ -6,7 +6,8 @@ The planner joins a :class:`~orchestrator.catalog.Catalog` with a
 * filter to the requested modality,
 * drop anything the host cannot fit (peak footprint vs usable VRAM/RAM),
 * drop non-shippable weights when ``shippable_only`` is set,
-* prefer the highest quality, then the lowest tier (cheapest that is good).
+* use the catalog preference if eligible; otherwise prefer the highest quality,
+  then the lowest tier (cheapest that is good).
 
 Disk size is deliberately **not** part of the fit test (design doc: disk is
 secondary; evict instead of downgrading).
@@ -54,6 +55,10 @@ class Planner:
                 raise ModelNotAvailableError(
                     f"{model_id} is {model.modality.value}, not {modality.value}"
                 )
+            if shippable_only and not model.shippable:
+                raise ModelNotAvailableError(f"{model_id} is not shippable")
+            if model.quality < min_quality:
+                raise ModelNotAvailableError(f"{model_id} is below minimum quality {min_quality}")
             if not self.report.fits(model.vram_gb, model.ram_gb):
                 raise ModelNotAvailableError(
                     f"{model_id} needs {model.vram_gb:.1f} GB VRAM / "
@@ -81,7 +86,12 @@ class Planner:
                 f"{considered} candidate(s) considered"
             )
 
-        # by_modality already sorts by (-quality, tier); take the best.
+        preferred_id = self.catalog.preferred_model_id(modality)
+        preferred = next((m for m in fitting if m.id == preferred_id), None)
+        if preferred is not None:
+            return Plan(preferred, "eligible catalog preference", considered)
+
+        # by_modality already sorts by (-quality, tier); take the best fallback.
         best = fitting[0]
         reason = (
             f"best of {len(fitting)} fitting {modality.value} model(s) "

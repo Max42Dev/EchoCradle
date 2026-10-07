@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import tomllib
+from pathlib import Path
+
 import pytest
 
 from orchestrator.catalog import Catalog, ModelDescriptor, Modality
@@ -53,3 +57,31 @@ def test_cpu_only_flag():
     catalog = Catalog.default()
     tts = catalog.by_modality(Modality.TTS)[0]
     assert tts.is_cpu_only, "speech models must not claim VRAM"
+
+
+def test_json_preferences_are_optional_and_data_driven(tmp_path) -> None:
+    model = Catalog.default().get("kokoro-en-v0_19")
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps({
+        "models": [model.to_dict()], "preferred_models": {"tts": model.id}
+    }), encoding="utf-8")
+    catalog = Catalog.from_json(path)
+    assert catalog.preferred_model_id(Modality.TTS) == model.id
+    assert catalog.preferred_model_id(Modality.TEXT) is None
+    path.write_text(json.dumps({"models": [model.to_dict()]}), encoding="utf-8")
+    assert Catalog.from_json(path).preferred_model_id(Modality.TTS) is None
+
+
+def test_catalog_copies_preferences() -> None:
+    preferences = {Modality.TEXT: "missing"}
+    catalog = Catalog([], preferred_models=preferences)
+    preferences.clear()
+    assert catalog.preferred_model_id(Modality.TEXT) == "missing"
+
+
+@pytest.mark.parametrize("extra", ["speech", "all"])
+def test_speech_extras_include_audio_device_runtime(extra: str) -> None:
+    path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    dependencies = data["project"]["optional-dependencies"][extra]
+    assert "sounddevice>=0.5" in dependencies

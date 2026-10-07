@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from orchestrator.catalog import Catalog, Modality
@@ -88,3 +90,79 @@ def test_explicit_model_that_does_not_fit_is_rejected():
     planner = Planner(catalog, _report(6.0))
     with pytest.raises(ModelNotAvailableError):
         planner.plan(Modality.TEXT, model_id="qwen2.5-14b-instruct-q4km")
+
+
+@pytest.mark.parametrize("modality, expected", [
+    (Modality.TEXT, "granite-4.2-8b-q4km"),
+    (Modality.TTS, "kokoro-en-v0_19"),
+    (Modality.STT, "sensevoice-small"),
+])
+def test_shipped_preferred_defaults(modality: Modality, expected: str) -> None:
+    plan = Planner(Catalog.default(), _report(24.0)).plan(modality)
+    assert plan.model.id == expected
+    assert "catalog preference" in plan.reason
+
+
+def test_preference_wins_over_higher_quality_when_eligible() -> None:
+    preferred = Catalog.default().get("granite-4.2-8b-q4km")
+    better = replace(preferred, id="higher-quality", quality=0.99)
+    catalog = Catalog([better, preferred], preferred_models={Modality.TEXT: preferred.id})
+    plan = Planner(catalog, _report(24.0)).plan(Modality.TEXT)
+    assert plan.model == preferred
+    assert plan.candidates_considered == 2
+
+
+@pytest.mark.parametrize("preference", ["missing", "kokoro-en-v0_19"])
+def test_missing_or_wrong_modality_preference_falls_back(preference: str) -> None:
+    models = list(Catalog.default())
+    catalog = Catalog(models, preferred_models={Modality.TEXT: preference})
+    plan = Planner(catalog, _report(24.0)).plan(Modality.TEXT)
+    assert plan.model.id == "granite-4.2-8b-q4km"
+    assert "best of" in plan.reason
+
+
+def test_custom_catalog_without_preferences_keeps_quality_selection() -> None:
+    preferred = Catalog.default().get("granite-4.2-8b-q4km")
+    better = replace(preferred, id="custom", quality=0.99)
+    assert Planner(Catalog([preferred, better]), _report(24.0)).plan(
+        Modality.TEXT
+    ).model == better
+
+
+def test_preference_below_min_quality_falls_back() -> None:
+    preferred = Catalog.default().get("granite-4.2-8b-q4km")
+    better = replace(preferred, id="custom", quality=0.99)
+    catalog = Catalog([preferred, better], preferred_models={Modality.TEXT: preferred.id})
+    assert Planner(catalog, _report(24.0)).plan(Modality.TEXT, min_quality=0.9).model == better
+
+
+@pytest.mark.parametrize("modality, report, expected", [
+    (Modality.TEXT, _report(8.0), "granite-4.2-3b-q4km"),
+    (Modality.TTS, _report(0.0, 0.3), "piper-en-lessac-medium"),
+    (Modality.STT, _report(0.0, 0.8), "zipformer-en-streaming"),
+])
+def test_nonfitting_preference_falls_back(
+    modality: Modality, report: ProbeReport, expected: str
+) -> None:
+    plan = Planner(Catalog.default(), report).plan(modality)
+    assert plan.model.id == expected
+    assert "best of" in plan.reason
+
+
+def test_disallowed_stt_preference_falls_back() -> None:
+    plan = Planner(Catalog.default(), _report(24.0)).plan(Modality.STT, shippable_only=True)
+    assert plan.model.id == "whisper-base-en"
+
+
+def test_explicit_nonshippable_model_is_rejected() -> None:
+    with pytest.raises(ModelNotAvailableError, match="shippable"):
+        Planner(Catalog.default(), _report(24.0)).plan(
+            Modality.STT, model_id="sensevoice-small", shippable_only=True
+        )
+
+
+def test_explicit_model_below_min_quality_is_rejected() -> None:
+    with pytest.raises(ModelNotAvailableError, match="minimum quality"):
+        Planner(Catalog.default(), _report(24.0)).plan(
+            Modality.TEXT, model_id="qwen2.5-1.5b-instruct-q4km", min_quality=0.9
+        )

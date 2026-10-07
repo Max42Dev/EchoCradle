@@ -1,6 +1,11 @@
 {
     "version": 1,
     "comment": "Open-weight models only. vram_gb is the PEAK footprint, not download size. tier = lowest machine tier that runs it comfortably. All URLs verified 2026-09-30.",
+    "preferred_models": {
+        "text": "granite-4.2-8b-q4km",
+        "tts": "kokoro-en-v0_19",
+        "stt": "sensevoice-small"
+    },
     "models": [
         {
             "id": "qwen2.5-1.5b-instruct-q4km",
@@ -204,7 +209,8 @@
                 "data_dir": "espeak-ng-data",
                 "voices": "voices.bin",
                 "sample_rate": 24000,
-                "num_speakers": 11
+                "num_speakers": 11,
+                "speaker_id": 7
             },
             "notes": "Best quality/price. 11 English voices via speaker id."
         },

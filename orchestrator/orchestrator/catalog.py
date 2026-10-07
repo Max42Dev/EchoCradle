@@ -101,8 +101,18 @@ class ModelDescriptor:
 class Catalog:
     """An immutable, queryable set of :class:`ModelDescriptor`."""
 
-    def __init__(self, models: list[ModelDescriptor]) -> None:
+    def __init__(
+        self,
+        models: list[ModelDescriptor],
+        *,
+        preferred_models: dict[Modality, str] | None = None,
+    ) -> None:
         self._models = {m.id: m for m in models}
+        self._preferred_models = dict(preferred_models or {})
+
+    def preferred_model_id(self, modality: Modality) -> str | None:
+        """A soft preference, not an exemption from planner eligibility checks."""
+        return self._preferred_models.get(modality)
 
     def __len__(self) -> int:
         return len(self._models)
@@ -129,7 +139,12 @@ class Catalog:
     @classmethod
     def from_json(cls, path: str | Path) -> Catalog:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        return cls([ModelDescriptor.from_dict(m) for m in data["models"]])
+        return cls(
+            [ModelDescriptor.from_dict(m) for m in data["models"]],
+            preferred_models={
+                Modality(key): value for key, value in data.get("preferred_models", {}).items()
+            },
+        )
 
     @classmethod
     def default(cls) -> Catalog:
