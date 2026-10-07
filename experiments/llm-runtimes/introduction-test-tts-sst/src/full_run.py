@@ -22,11 +22,9 @@ if _ORCHESTRATOR_PARENT.is_dir() and str(_ORCHESTRATOR_PARENT) not in sys.path:
 
 from orchestrator import (  # noqa: E402
     JsonConfigTool,
-    ModelOrchestrator,
-    Modality,
     ToolRegistry,
 )
-from orchestrator.errors import OrchestratorError  # noqa: E402
+from orchestrator.client import ServiceClient  # noqa: E402
 
 from config_schema import CONFIG_SCHEMA, validate_config  # noqa: E402
 from interview import Interview  # noqa: E402
@@ -44,20 +42,16 @@ OUT = Path(__file__).resolve().parent.parent / "out" / "full_run_config.json"
 
 def main() -> int:
     print("Probing this machine ...")
-    mo = ModelOrchestrator()
+    mo = ServiceClient(profile="text")
     try:
         return _run(mo)
     finally:
         mo.stop()
 
 
-def _run(mo: ModelOrchestrator) -> int:
-    try:
-        model = mo.ensure_model(Modality.TEXT)
-    except OrchestratorError as exc:
-        print(f"Cannot run: {exc}", file=sys.stderr)
-        return 2
-    print(f"  text -> {model.id}\n")
+def _run(mo: ServiceClient) -> int:
+    model = mo.capabilities()["kinds"]["text"]["model_id"]
+    print(f"  text -> {model}\n")
 
     tool = JsonConfigTool(CONFIG_SCHEMA, name="config")
     registry = ToolRegistry()

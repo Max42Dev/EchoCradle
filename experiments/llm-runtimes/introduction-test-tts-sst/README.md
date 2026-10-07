@@ -1,14 +1,45 @@
 # introduction-test-tts-sst — the orchestrator's first end-to-end run
 
-**Status:** done
-**Date:** 2026-09-30
+## Native client tools (2026-10-07)
+
+The interview uses native tool calling on every turn. The client sends its
+registry's descriptions and parameter schemas to the service; Granite decides
+whether to call a tool. Calls execute only in the client and results return to
+the model before it continues. There is no JSON speech envelope, forced tool
+choice or separate extraction pass. The service accepts application-defined
+tools rather than owning an experiment-specific config schema.
+
+Slow Kokoro synthesis and playback never block the network consumer: sentence
+callbacks hand off bounded-per-turn text immediately to the speech worker.
+Cancellation and spoken-delivery bookkeeping remain client-owned.
+
+**Status:** bounded service/client slice implemented; real-model offline smoke passed
+**Date:** 2026-10-06 (historical in-process findings began 2026-09-30)
 **Author:** agent
+
+`src/main.py` is now the **service-client entrypoint**: it automatically starts
+one contained owner service (or attaches with `--service-url`). Models and the
+llama.cpp runtime must already be cached; **no fresh downloads occur on this
+launch path**. REST carries jobs and complete PCM artifacts; JSON WebSocket
+carries text and remote compiled `config_set` calls. Capture, local VAD,
+playback and delivery/history bookkeeping stay in the Python client.
+There is no binary WebSocket/credit transport, server history reconciliation,
+joint resource admission/provisioning or Unity client. Native service speech
+crashes can terminate the whole process despite its three worker lanes.
+
+See [precise service usage](../../../docs/SERVICE_USAGE.md) and the
+[broader design reference](../../../docs/ORCHESTRATOR_SERVICE.md).
+Historical `diagnostic_run.py`, `diagnose_*.py`, model benchmarks and hardware
+tests below are explicitly **in-process model/device experiments**, not the
+current main entrypoint or cached-only service setup instructions.
 
 ## Question
 
 Can the **Model Orchestrator** drive a real, multi-modal, multi-turn application
-— an LLM that interviews the player by voice and fills a config file — while
-picking its own models for the host machine and downloading them on demand?
+— an LLM that interviews the player by voice and fills a config file — through
+a separate local service using already cached models? The original in-process
+experiment also measured model selection and first-use downloads; those are
+historical findings, not today's service launch behavior.
 
 ## Hypothesis
 
@@ -16,7 +47,7 @@ Yes. If the orchestrator's planner, store and hosts are correct, a terminal app
 should be able to:
 
 1. probe the machine and choose a text model, a TTS voice and an STT model,
-2. download whatever is missing into one shared store,
+2. reuse the shared store and fail clearly if selected service assets are missing,
 3. hold a spoken conversation in which the LLM records structured values,
 4. validate the result against a schema and write it to disk.
 
@@ -45,17 +76,22 @@ fragmentation slack, 15.4 GB RAM). The planner then chose:
 | tts | `kokoro-en-v0_19` (speaker 7, `bf_emma`) | 298 MB | Apache-2.0 | natural voice, CPU-only, 11 speakers |
 | stt | `sensevoice-small` | 229 MB | ⚠️ FunASR terms | 0% WER on real recordings, 21× realtime |
 
-The 14B text model was *not* chosen: at 11.5 GB peak it does not fit the
-co-residency budget alongside a generator, and it is a 2024 model with weaker
-tool-calling post-training than Granite 4.2-8B. This is the planner working as
-designed, not a limitation.
+The current defaults are central catalog preferences, not experiment-owned
+model IDs. Granite 4.2-8B is the proven text preference even if a larger model
+fits. Missing, nonfitting or disallowed preferences fall back to quality/fit
+selection. `--shippable-only` excludes SenseVoice (including explicit pins).
+Joint portfolio/co-residency optimization with a Unity VRAM reserve is **design
+only**, not implemented; today's planner checks individual models against the
+probe budget and does not reserve room for a concurrently loaded generator.
 
 ### Voice choice
 
 Piper's `amy-low` was used during development only because it downloads in 13 s
 versus Kokoro's 49 s. It is the **lowest quality tier** of a 16 kHz VITS model
-and sounds noticeably robotic. The experiment now defaults to **Kokoro
-`bf_emma`** (British female, speaker id 7).
+and sounds noticeably robotic. The orchestrator now defaults centrally to
+**Kokoro `bf_emma`** (British female, speaker id 7). The experiment leaves models
+and voice unspecified unless a CLI override is supplied. A smaller-RAM Piper
+fallback uses its own default speaker 0, not Kokoro's speaker 7.
 
 Measured on this box, one 8 s sentence, CPU synthesis:
 
@@ -83,54 +119,86 @@ the measurements and the two fixes that were needed.
 > The instance role has no `ec2:` permissions, so this can only be changed in
 > the AWS console.
 
-## How to run
+## How to run (current service architecture)
 
 ```powershell
-# One-time: install the orchestrator and the speech runtime.
-cd c:\projects\EchoCradle
-python -m pip install -e .\orchestrator
-python -m pip install sherpa-onnx numpy
-
-# See what this machine can do, without downloading anything.
+cd C:\projects\EchoCradle
+python -m pip install -e ".\orchestrator[all,dev]"
 cd experiments\llm-runtimes\introduction-test-tts-sst\src
-python main.py --capabilities
 
-# Run the interview. First run downloads the models (~1 GB for the small set).
-python main.py
-
-# Hear it. Playback is off by default so automated runs stay silent.
-python main.py --play
-
-# Text only, no audio.
-python main.py --no-tts
-
-# Pin specific models (useful when testing the orchestrator itself).
-python main.py --text-model qwen2.5-1.5b-instruct-q4km --tts-model piper-en-amy-low
-
-# Change the voice (Kokoro has 11; 7 = bf_emma, the default).
-python main.py --play --speaker-id 9
-
-# Full voice conversation: speak out, listen on the live microphone.
+# Automatically launches/owns one cached voice service; headphones required.
 python main.py --play --mic
 
-# Take the player's replies from a WAV file instead of the keyboard (STT path).
+# Typed replies with no synthesis: cached text profile only.
+python main.py --no-tts
+
+# Starts and loads the cached profile, then prints capabilities; no downloads.
+python main.py --capabilities
+
+# Typed replies with speaker playback (playback is off by default).
+python main.py --play
+
+# Completed PCM16 WAV input instead of the microphone.
 python main.py --stt-file reply.wav
 
-# Hardware / setup test: play a phrase while recording the mic for 10s, then
-# transcribe. Independent of the interview — use it to check audio routing.
-# Auto-picks the working input device; pass --device N to pin one.
-python src\hw_test.py --seconds 10
+# Startup-only voice override for an owned service, never a gameplay field.
+python main.py --play --speaker-id 9
 
-# Tests.
-cd ..\..\..\..\orchestrator ; python -m pytest -q
-
-# Live test: drives the real model end to end (slow; downloads on first use).
-# Excluded from the default run. A failing run writes a full transcript to out/.
-cd experiments\llm-runtimes\introduction-test-tts-sst ; python -m pytest -m llm -q
-cd ..\experiments\llm-runtimes\introduction-test-tts-sst ; python -m pytest -q
+# Real-model service smoke; --out must be new/empty. Add --play optionally.
+python service_smoke.py --out ..\out\service_smoke_new_run
 ```
 
+Dependencies are not model/runtime provisioning. Cached selected text/TTS/STT
+and llama.cpp are prerequisites; `--mic` also requires cached Silero VAD.
+`--text-model`, `--tts-model`, `--stt-model`, `--speaker-id` and
+`--shippable-only` configure startup policy, not gameplay or hot swaps. Attached
+clients reject these supplied policy overrides. For standalone port 5010,
+cryptographically generated **environment** token and
+`--service-url http://127.0.0.1:5010`, follow
+[SERVICE_USAGE.md](../../../docs/SERVICE_USAGE.md#standalone-service-and-attached-experiment).
+An attached client never shuts down the service; the default service token
+nevertheless grants the shutdown route (no separate owner credential).
+
+Offline test commands from the repository root:
+
+```powershell
+cd C:\projects\EchoCradle\orchestrator
+python -m pytest -q
+cd ..\experiments\llm-runtimes\introduction-test-tts-sst
+python -m pytest -q
+```
+
+Historical diagnostic scripts and `llm`-marked direct-host tests are separate
+in-process model experiments, not `main.py` launch instructions; their setup
+paths may download assets. Use `service_smoke.py` for current service evidence.
+
 ## Results
+
+### Service/client and real-model smoke (2026-10-06)
+
+`main.py`, including `--mic` and `--stt-file`, now uses `ServiceClient`. The
+owned service resolves omitted IDs via central preferences at startup. Its
+control loop submits bounded jobs to serialized text/TTS/STT worker lanes;
+the Python client calls and tool/text callbacks are still synchronous on their
+calling thread. The experiment coordinates local voice interruption/playback.
+Preferred SenseVoice decodes a completed utterance, with no service partials.
+The exact implemented `JobSpec` supports text/dialogue/tts/stt and differs from
+the original design; see [usage](../../../docs/SERVICE_USAGE.md#exact-jobspec).
+
+Real service smoke **passed**, recorded in `out/service_smoke_peter/report.json`:
+Granite 4.2-8B / Kokoro (speaker 7) / SenseVoice produced a validated config with
+`username: Max`, `style: medieval with mountains and ancient castles`,
+`ai_name: Peter`. Auth/Origin/Host/payload checks, idempotency, text cancellation
+and lane recovery, remote config calls and TTS → saved WAV → STT ran against
+real models. The report explicitly records **no speaker playback and no
+microphone test**; it does not validate full-duplex voice or live barge-in.
+The existing client delivery ledger is not a server history mirror/reconciliation.
+
+### Historical in-process findings
+
+The findings below retain earlier measurements and debugging chronology.
+Descriptions of first-use downloads, direct host calls, recognizer partials and
+earlier capture/endpointing implementations are **not current service behavior**.
 
 ### Voice interruption fixes (2026-10-04)
 
@@ -193,7 +261,7 @@ All three modalities were verified against real models on this box:
 | Check | Result |
 |---|---|
 | Probe + tier | tier 3, 16.8 GB usable VRAM, correct per the design doc's bands |
-| Planner | picked Granite 4.2-8B text / Kokoro TTS / Zipformer STT; refused the 14B as too large |
+| Planner (historical run) | picked Granite 4.2-8B text / Kokoro TTS / Zipformer STT; current preferred STT is SenseVoice |
 | Lazy download | text 43.6 s, Kokoro 48.6 s, Piper 12.7 s, Zipformer 21.0 s (first run only) |
 | Reuse | second run loads from the store with no download |
 | Text chat | `'ready'` in **0.06 s**; schema-constrained JSON in **0.31 s** |
@@ -844,13 +912,18 @@ future experiment.
 
 - [ ] Promote the tool-calling finding to `ideas/model-orchestrator/text.md`.
 - [ ] Add the remaining hosts (image, mesh3d, music, sfx) behind the same contract.
-- [ ] Add the HTTP surface from the design doc so Unity can use the orchestrator.
+- [x] Implement the bounded Python service/client and real-model offline smoke.
+- [ ] Build a Unity client; implement binary PCM/credits and server delivery/history.
+- [ ] Validate the service-based microphone/playback/barge-in path live.
+- [ ] Add explicit provisioning and joint resource admission from the design reference.
 - [ ] Implement the scheduler's VRAM bin-packing (currently one model per host).
 - [ ] Try a dedicated extraction model (xLAM-2-3b, ToolACE-2-8B) for the second call.
 - [ ] Re-test the single-prompt design on a 14B+ model to see if the split is still needed.
 
 ## Links
 
+- Service usage: [`../../../docs/SERVICE_USAGE.md`](../../../docs/SERVICE_USAGE.md)
+- Design reference/status: [`../../../docs/ORCHESTRATOR_SERVICE.md`](../../../docs/ORCHESTRATOR_SERVICE.md)
 - Orchestrator: [`../../../orchestrator/`](../../../orchestrator/)
 - Related idea: [`../../../ideas/model-orchestrator/modelorchestrator.md`](../../../ideas/model-orchestrator/modelorchestrator.md)
 - Text runtime: [`../../llm-runtimes/0101-text-runtime-selection/`](../0101-text-runtime-selection/)

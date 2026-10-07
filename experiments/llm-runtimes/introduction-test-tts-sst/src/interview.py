@@ -313,10 +313,7 @@ class Interview:
 
         try:
             _text, calls = self.orchestrator.stream_chat_with_tools(
-                messages,
-                self.registry,
-                max_tokens=400,
-                temperature=0.8,
+                messages, self.registry, max_tokens=400, temperature=0.4,
                 on_text=on_text,
                 should_stop=should_stop,
             )
@@ -366,44 +363,21 @@ class Interview:
                 self.config_tool.data.pop(name, None)
 
     def _ask(self, messages: list[dict[str, str]]) -> tuple[str, list[Any], bool]:
-        """One turn: let the model call tools, then read its spoken line.
-
-        Returns ``(say, tool_calls, repaired)``. The reply is plain text; a reply
-        that talks about the machinery instead of the player is rejected and the
-        model is asked again.
-        """
-        try:
-            text, calls = self.orchestrator.chat_with_tools(
-                messages,
-                self.registry,
-                max_tokens=400,
-                temperature=0.8,
-            )
-        except Exception as exc:  # noqa: BLE001 - surfaced as a fallback line
-            log.warning("text host failed: %s", exc)
-            return "", [], True
-
-        say = self._spoken_line(text)
-        if say:
-            return say, calls, False
-
-        # Nothing usable came back. Ask once more, plainly, for the line only.
-        try:
-            text = self.orchestrator.chat(
-                messages
-                + [
-                    {
-                        "role": "system",
-                        "content": SPOKEN_RETRY_PROMPT,
-                    }
-                ],
-                max_tokens=200,
-                temperature=0.8,
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("text host failed on the spoken line: %s", exc)
-            return "", calls, True
-        return self._spoken_line(text), calls, True
+        """Native tools remain available on every attempt; the model chooses calls."""
+        calls: list[Any] = []
+        for attempt in range(2):
+            try:
+                text, requested = self.orchestrator.chat_with_tools(
+                    messages, self.registry, max_tokens=400, temperature=0.4,
+                )
+                calls.extend(requested)
+                say = self._spoken_line(text)
+                if say:
+                    return say, calls, bool(attempt)
+                messages = messages + [{"role": "system", "content": SPOKEN_RETRY_PROMPT}]
+            except Exception as exc:  # noqa: BLE001 - bounded retry, then fallback
+                log.warning("text host failed: %s", exc)
+        return "", calls, True
 
     @classmethod
     def _spoken_line(cls, raw: str) -> str:

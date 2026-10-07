@@ -60,6 +60,8 @@ class FakeOrchestrator:
         """
         self.calls.append(messages)
         calls = []
+        if should_stop is not None and should_stop():
+            return "", calls
         if self.tool_calls:
             from orchestrator.tools import ToolCall
 
@@ -95,6 +97,21 @@ def test_opening_asks_without_user_input():
     assert not turn.done
 
 
+def test_opening_without_tool_calls_leaves_config_empty():
+    interview, tool, _ = _make([_say("Hello.")])
+    interview.opening()
+    assert tool.data == {}
+
+
+def test_cancelled_turn_never_executes_tools():
+    interview, tool, _ = _make([], tool_calls=[[
+        ("config_set", {"field": "username", "value": "Ada"}),
+    ]])
+    turn, interrupted = interview.respond_streaming("I'm Ada.", lambda text: None,
+                                                   should_stop=lambda: True)
+    assert interrupted and not turn.tool_calls and not tool.data
+
+
 def test_model_records_a_value_while_conversing():
     interview, tool, _ = _make(
         [_say("Ada, is it?")],
@@ -104,6 +121,27 @@ def test_model_records_a_value_while_conversing():
     assert tool.data["username"] == "Ada"
     assert turn.say == "Ada, is it?"
     assert len(turn.tool_calls) == 1
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_native_tools_record_values_in_both_turn_modes(streaming):
+    interview, tool, _ = _make(["Ada, is it?"], tool_calls=[[
+        ("config_set", {"field": "username", "value": "Ada"}),
+    ]])
+    if streaming:
+        spoken = []
+        turn, interrupted = interview.respond_streaming("I'm Ada.", spoken.append)
+        assert not interrupted and spoken == ["Ada, is it?"]
+    else:
+        turn = interview.respond("I'm Ada.")
+    assert tool.data == {"username": "Ada"}
+    assert turn.tool_calls[0].result["ok"]
+
+
+def test_no_native_call_does_not_fabricate_config_updates():
+    interview, tool, _ = _make(["Hello."])
+    interview.respond("I'm Ada.")
+    assert tool.data == {}
 
 
 def test_several_values_in_one_turn():
@@ -416,8 +454,9 @@ def test_prompt_instructs_transcript_resolution_and_correction_without_bookkeepi
     assert "including fields already filled" in prompt
     assert "Record confirmed values" in prompt
     assert "never repeat bookkeeping" in prompt
+    assert "JSON" not in prompt
     assert "interruption notes are not dialogue" in prompt
-    assert len(prompt.split()) < 220
+    assert len(prompt.split()) < 350
 
 
 def test_interruption_metadata_is_private_not_assistant_dialogue():

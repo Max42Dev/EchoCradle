@@ -40,6 +40,7 @@ from orchestrator import (  # noqa: E402
     ToolRegistry,
 )
 from orchestrator.errors import OrchestratorError  # noqa: E402
+from orchestrator.client import ServiceClient  # noqa: E402
 from orchestrator.hosts import text as text_host  # noqa: E402
 
 pytestmark = pytest.mark.llm
@@ -84,9 +85,8 @@ class LlmPlayer:
 @pytest.fixture(scope="module")
 def orchestrator():
     """A real orchestrator with a text model loaded, or skip."""
-    mo = ModelOrchestrator()
     try:
-        mo.ensure_model(Modality.TEXT)
+        mo = ServiceClient(profile="text")
     except OrchestratorError as exc:
         pytest.skip(f"no text model available: {exc}")
     yield mo

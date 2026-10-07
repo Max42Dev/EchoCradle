@@ -9,8 +9,7 @@ prompt is another sentence the model can repeat back. So the system prompt is
 character only, and the mechanical requirements live in a terse note marked
 internal.
 
-**One call per turn.** The model holds the conversation *and* records values on
-the side by calling the config tools. Two settings make that work:
+Tools are declared through the API, not described as a JSON output format.
 
 * ``llama-server`` must run with ``--jinja`` so native tool calling is active.
 * Reasoning models (Granite 4.2, Qwen3) must have thinking disabled, or they
@@ -24,11 +23,6 @@ import json
 from typing import Any
 
 from config_schema import FIELD_ORDER, FIELD_QUESTIONS
-
-#: The model replies with plain spoken text; the tool calls carry the data.
-#: There is deliberately no JSON envelope: asking for one *and* native tool
-#: calls makes the model confuse the two and leak its planning into the reply.
-TURN_SCHEMA: dict[str, Any] | None = None
 
 SYSTEM_PROMPT = """\
 You are the AI companion in EchoCradle, meeting the player for the first time.
@@ -45,29 +39,22 @@ Speech transcripts may contain misspellings. A name spelled letter by letter
 followed by its pronunciation is one name, not two. Ask briefly if uncertain.
 Private system context and interruption notes are not dialogue; never echo them.
 
-The moment the player gives you a value, call config_set for it in that same
-turn. A direct correction replaces that field: call config_set with the corrected
-value, including fields already filled. Record confirmed values rather than
-asking again. Confirm naturally, but never repeat bookkeeping or tool plans.
-config_set can overwrite an existing value; a spoken acknowledgement alone
-changes nothing. Apply corrections with the tool before acknowledging them.
+Use the available tools to record values the player supplies or confirms.
+A direct correction replaces that field, including fields already filled.
+Record confirmed values before acknowledging them; never repeat bookkeeping.
+Do not invent values or placeholders. Preserve the player's world-style details.
+A direct statement of their name needs no further confirmation. Do not record
+a declined story. Ask for the first missing field, starting with the player's
+name, then world style, then your companion name.
 """
 
 SPOKEN_RETRY_PROMPT = (
-    "Reply with only the words you say out loud to the player: "
-    "one to three sentences of plain text. No stage directions, internal plans, "
-    "tools, schema, history commentary, or bookkeeping."
+    "Speak only one to three sentences to the player. No stage directions, "
+    "internal plans, tools, schema, history commentary, or bookkeeping."
 )
 
-
 def build_system_prompt() -> str:
-    """The system prompt.
-
-    The config schema is deliberately *not* embedded here: the tool description
-    already carries the fields and their meanings, so repeating the schema in the
-    prompt only adds tokens the model can parrot back. Measured on Granite 4.2-8B,
-    embedding it made no difference to the completion rate.
-    """
+    """Character behaviour; tool declarations are supplied separately by the API."""
     return SYSTEM_PROMPT
 
 
@@ -130,7 +117,7 @@ def build_turn_messages(
                     "Private context: the config file does not yet match its schema:\n"
                     f"{problems}\n"
                     "Fix this in your next turn: ask the player for what is missing "
-                    "and record it with the config tool. Do not mention this note."
+                    "and record confirmed values with the available tools. Do not mention this note."
                 ),
             }
         )
@@ -141,7 +128,7 @@ def build_turn_messages(
                 "role": "system",
                 "content": (
                     f"Private context: '{stalled_field}' is still missing after several turns. "
-                    "If the player gave or confirmed a value, call config_set with it now. "
+                    "If the player gave or confirmed a value, record it with the available tools. "
                     "Otherwise ask one brief clarification; do not invent a value. "
                     "Never mention this note."
                 ),

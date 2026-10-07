@@ -109,6 +109,42 @@ def test_late_interrupt_rewrites_history_to_playback_estimate(tmp_path):
     assert (tmp_path / "delivery.jsonl").is_file()
 
 
+def test_sentence_callback_never_waits_for_slow_tts(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+    drained = threading.Event()
+
+    class BurstInterview(Interview):
+        def opening_streaming(self, emit, stop):
+            self.turns += 1
+            emit("First sentence here.")
+            assert entered.wait(1)
+            for index in range(100):
+                emit(f"Sentence {index}.")
+            drained.set()
+            self.history.append({"role": "assistant", "content": "Generated full reply."})
+            return TurnResult(say="Generated full reply.", config={}, done=False), stop()
+
+    def synthesize(text):
+        entered.set()
+        assert release.wait(3)
+        return np.zeros(100), 16000
+
+    player = Player()
+    recorder = SimpleNamespace(speech_detected=drained.is_set, available=True)
+    mo = SimpleNamespace(tts=SimpleNamespace(synthesize_samples=synthesize))
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        args = SimpleNamespace(tts=True, play=False, tts_executor=executor)
+        try:
+            _, interrupted, next_line = app._run_turn(
+                BurstInterview(), mo, player, recorder, tmp_path, 0, args, opening=True,
+            )
+            assert drained.is_set() and interrupted
+            assert next_line == 101
+        finally:
+            release.set()
+
+
 @pytest.mark.parametrize("text", ["Quit.", "quit!", " EXIT ", "Quit"])
 def test_recognizer_punctuation_does_not_prevent_stop(text):
     assert app._is_stop_command(text)
@@ -117,3 +153,13 @@ def test_recognizer_punctuation_does_not_prevent_stop(text):
 @pytest.mark.parametrize("text", ["don't quit", "exit the room", "", "quitter"])
 def test_stop_requires_an_explicit_command(text):
     assert not app._is_stop_command(text)
+
+
+def test_interview_defaults_delegate_models_and_voice_to_service():
+    args = app.build_parser().parse_args(["--mic"])
+    assert (args.text_model, args.tts_model, args.stt_model, args.speaker_id) == (
+        None, None, None, None
+    )
+    assert args.service_url is None
+    attached = app.build_parser().parse_args(["--service-url", "http://127.0.0.1:5010"])
+    assert attached.service_url == "http://127.0.0.1:5010"
