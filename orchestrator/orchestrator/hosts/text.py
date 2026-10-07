@@ -229,18 +229,30 @@ class TextHost:
         *,
         max_tokens: int = 512,
         temperature: float = 0.7,
+        json_schema: dict[str, Any] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> Iterator[str]:
-        """Stream a completion as text deltas (SSE)."""
+        """Stream plain or schema-constrained text, with interruptible body reads."""
         payload = self._payload(
             messages, max_tokens=max_tokens, temperature=temperature, stream=True
         )
-        for chunk in self._sse_chunks(payload):
-            try:
-                delta = chunk["choices"][0]["delta"].get("content")
-            except (KeyError, IndexError, TypeError):
-                continue
-            if delta:
-                yield delta
+        if json_schema is not None:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "response", "schema": json_schema, "strict": True},
+            }
+        stream = (self._sse_chunks(payload, should_stop=should_stop)
+                  if should_stop is not None else self._sse_chunks(payload))
+        with closing(stream):
+            for chunk in stream:
+                if should_stop is not None and should_stop():
+                    return
+                try:
+                    delta = chunk["choices"][0]["delta"].get("content")
+                except (KeyError, IndexError, TypeError):
+                    continue
+                if delta:
+                    yield delta
 
     def stream_chat_with_tools(
         self,

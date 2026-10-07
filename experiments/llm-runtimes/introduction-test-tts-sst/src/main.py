@@ -1,8 +1,8 @@
 """Introduction Test (TTS + STT): a terminal interview driven by the orchestrator.
 
 The AI interviews the player to fill a config file, speaking its lines and
-listening to the replies. Everything runs through the Model Orchestrator, which
-picks the models for this machine and downloads them on first use.
+listening to the replies. Inference runs in a separate authenticated local
+orchestrator service using cached models. Device I/O and config actions stay here.
 
 Usage::
 
@@ -43,46 +43,20 @@ from orchestrator import (
     AudioRecorder,
     ContinuousRecorder,
     JsonConfigTool,
-    ModelOrchestrator,
-    Modality,
     ToolRegistry,
     pick_input_device,
     write_wav,
 )  # noqa: E402
 from orchestrator.errors import OrchestratorError  # noqa: E402
+from orchestrator.client import ServiceClient  # noqa: E402
 
 from config_schema import CONFIG_SCHEMA, validate_config  # noqa: E402
 from interview import Interview  # noqa: E402
 
 DEFAULT_OUT = Path(__file__).resolve().parent.parent / "out" / "config.json"
 
-#: The voice this experiment uses. Kokoro's `bf_emma` is a British female voice
-#: and one of the better-graded Kokoro voices; Piper's low-tier voices sound
-#: noticeably robotic by comparison.
-DEFAULT_TTS_MODEL = "kokoro-en-v0_19"
-DEFAULT_SPEAKER_ID = 7  # bf_emma
-
-#: The mic uses the **offline** recogniser. A streaming model endpoints on its
-#: own, but `zipformer-en-streaming` measured 23% WER and misheard names
-#: ("Max" -> "MEX"); `sensevoice-small` is far more accurate on real microphone
-#: audio. The cost is that it cannot decode incrementally, so the recorder
-#: captures the whole utterance first (energy-endpointed) and decodes it once.
-DEFAULT_MIC_STT_MODEL = "sensevoice-small"
-
-
-def _progress(label: str, done: int, total: int) -> None:
-    if total <= 0:
-        return
-    pct = done * 100 // total
-    mb = done / (1024 * 1024)
-    total_mb = total / (1024 * 1024)
-    print(f"\r  downloading {label}: {pct:3d}%  ({mb:6.1f}/{total_mb:.1f} MB)", end="")
-    if done >= total:
-        print()
-
-
 def _play_sentence(
-    mo: ModelOrchestrator,
+    mo: ServiceClient,
     player: AudioPlayer,
     sentence: str,
     out_dir: Path,
@@ -107,7 +81,7 @@ def _play_sentence(
 
 def _run_turn(
     interview: Interview,
-    mo: ModelOrchestrator,
+    mo: ServiceClient,
     player: AudioPlayer,
     recorder: ContinuousRecorder | None,
     out_dir: Path,
@@ -124,7 +98,9 @@ def _run_turn(
     turn's history keeps only the sentences that were actually spoken, so the
     model's next turn sees exactly what the player heard.
     """
-    sentences: queue.Queue[tuple[int, str]] = queue.Queue(maxsize=8)
+    # Text is already bounded by the service's per-turn token/byte limits.
+    # Never backpressure the socket consumer on slow synthesis or playback.
+    sentences: queue.Queue[tuple[int, str]] = queue.Queue()
     cancelled = threading.Event()
     generated = threading.Event()
     synthesized = threading.Event()
@@ -139,13 +115,7 @@ def _run_turn(
             return
         index = line + len(emitted)
         emitted.append(sentence)
-        print(f"ai>  {sentence}")
-        while not cancelled.is_set():
-            try:
-                sentences.put((index, sentence), timeout=0.05)
-                return
-            except queue.Full:
-                continue
+        sentences.put_nowait((index, sentence))
 
     def generate() -> None:
         try:
@@ -169,6 +139,7 @@ def _run_turn(
                     if generated.is_set():
                         return
                     continue
+                print(f"ai>  {sentence}")
                 if not args.tts:
                     continue
                 if cancelled.is_set():
@@ -281,7 +252,7 @@ def _report_turn(turn: Any) -> None:
 
 
 def _listen(
-    mo: ModelOrchestrator,
+    mo: ServiceClient,
     wav: Path | None,
     recorder: ContinuousRecorder | None,
     *,
@@ -334,7 +305,15 @@ def run(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("Probing this machine ...")
-    mo = ModelOrchestrator(shippable_only=args.shippable_only)
+    mo = ServiceClient(
+        profile="voice" if args.tts or args.mic or args.stt_file else "text",
+        url=args.service_url,
+        shippable_only=args.shippable_only,
+        text_model=args.text_model,
+        tts_model=args.tts_model,
+        stt_model=args.stt_model,
+        speaker_id=args.speaker_id,
+    )
     try:
         return _run(args, mo, out_dir)
     finally:
@@ -342,7 +321,7 @@ def run(args: argparse.Namespace) -> int:
         mo.stop()
 
 
-def _run(args: argparse.Namespace, mo: ModelOrchestrator, out_dir: Path) -> int:
+def _run(args: argparse.Namespace, mo: ServiceClient, out_dir: Path) -> int:
     if args.capabilities:
         print(json.dumps(mo.capabilities(), indent=2))
         return 0
@@ -354,25 +333,17 @@ def _run(args: argparse.Namespace, mo: ModelOrchestrator, out_dir: Path) -> int:
         f"{probe.ram_gb:.1f} GB RAM  |  {probe.free_disk_gb:.1f} GB free disk"
     )
 
-    print("\nSelecting and loading models (first run downloads them) ...")
-    try:
-        text_model = mo.ensure_model(Modality.TEXT, model_id=args.text_model, progress=_progress)
-        print(f"  text -> {text_model.id}")
-        if args.tts:
-            tts_model = mo.ensure_model(Modality.TTS, model_id=args.tts_model, progress=_progress)
-            mo.tts.speaker_id = args.speaker_id
-            print(f"  tts  -> {tts_model.id} (speaker {args.speaker_id})")
-        if args.stt_file or args.mic:
-            # The mic wants a *streaming* recogniser so partials appear while the
-            # player is still speaking. The catalog default (sensevoice-small)
-            # is offline and only decodes once the utterance ends, so pin the
-            # streaming model unless the caller chose one explicitly.
-            stt_id = args.stt_model or (DEFAULT_MIC_STT_MODEL if args.mic else None)
-            stt_model = mo.ensure_model(Modality.STT, model_id=stt_id, progress=_progress)
-            print(f"  stt  -> {stt_model.id}")
-    except OrchestratorError as exc:
-        print(f"\nCannot run on this machine: {exc}", file=sys.stderr)
-        return 2
+    print("\nCached models loaded by the local service:")
+    capabilities = mo.capabilities()
+    for kind in ("text", "tts", "stt"):
+        required = kind == "text" or (kind == "tts" and args.tts) or (
+            kind == "stt" and (args.mic or args.stt_file)
+        )
+        if required:
+            status = capabilities["kinds"][kind]
+            if status["state"] != "ready":
+                raise OrchestratorError(f"Required service capability {kind} is not ready")
+            print(f"  {kind:4} -> {status['model_id']}")
 
     # The config document is owned by a tool the model can call, not by the
     # model's memory. The interview only ever writes through validated calls.
@@ -529,16 +500,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-model", default=None, help="pin a catalog model id for text")
     parser.add_argument(
         "--tts-model",
-        default=DEFAULT_TTS_MODEL,
-        help=f"pin a catalog model id for speech output (default: {DEFAULT_TTS_MODEL})",
+        default=None,
+        help="pin a catalog model id for speech output (default: orchestrator selection)",
     )
     parser.add_argument(
         "--speaker-id",
         type=int,
-        default=DEFAULT_SPEAKER_ID,
-        help=f"TTS speaker id for multi-voice models (default: {DEFAULT_SPEAKER_ID} = bf_emma)",
+        default=None,
+        help="override the TTS speaker id (default: selected model's catalog voice)",
     )
     parser.add_argument("--stt-model", default=None, help="pin a catalog model id for speech input")
+    parser.add_argument(
+        "--service-url", default=None,
+        help="attach to a local service; bearer token comes from ECHOCRADLE_SERVICE_TOKEN. "
+        "By default launch and own one service process.",
+    )
     parser.add_argument("--max-turns", type=int, default=12, help="safety limit on conversation length")
     parser.add_argument("--shippable-only", action="store_true", help="refuse non-commercial weights")
     parser.add_argument("--force", action="store_true", help="write the config even if validation fails")
@@ -564,6 +540,9 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\n(interrupted)")
         return 130
+    except OrchestratorError as exc:
+        print(f"\nCannot run the local service interview: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

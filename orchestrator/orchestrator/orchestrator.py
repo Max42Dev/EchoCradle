@@ -49,7 +49,7 @@ class ModelOrchestrator:
         shippable_only: bool = False,
         cache: Path | None = None,
     ) -> None:
-        self.catalog = catalog or Catalog.default()
+        self.catalog = catalog if catalog is not None else Catalog.default()
         self.store = store or ModelStore()
         self.report = report or probe()
         self.planner = Planner(self.catalog, self.report)
@@ -143,6 +143,14 @@ class ModelOrchestrator:
         host = self._hosts[modality]
         if host.loaded_model_id != plan.model.id:
             host.load(installed)
+            if modality is Modality.TTS:
+                speaker = plan.model.params.get("speaker_id", 0)
+                # A fallback model may have only one voice. Never carry Kokoro's
+                # speaker (or a previous override) into a different model.
+                self.tts.speaker_id = (
+                    speaker if isinstance(speaker, int) and 0 <= speaker < self.tts.num_speakers
+                    else 0
+                )
         return plan.model
 
     def capabilities(self) -> dict[str, Any]:
@@ -358,10 +366,19 @@ class ModelOrchestrator:
 
     def _ensure_loaded(self, modality: Modality, model_id: str | None) -> None:
         host = self._hosts[modality]
-        if model_id is not None and host.loaded_model_id == model_id:
-            return
-        if model_id is None and host.loaded_model_id is not None:
-            return
+        loaded_id = host.loaded_model_id
+        if loaded_id is not None and (model_id is None or model_id == loaded_id):
+            try:
+                self.planner.plan(
+                    modality, model_id=loaded_id, shippable_only=self.shippable_only
+                )
+            except (ModelNotAvailableError, KeyError):
+                # No-ID callers can fall back if the loaded model is no longer
+                # eligible. Explicit overrides must still pass all checks.
+                if model_id is not None:
+                    raise
+            else:
+                return
         self.ensure_model(modality, model_id=model_id)
 
 
