@@ -28,6 +28,22 @@ def test_by_modality_sorts_by_quality_descending():
     assert qualities == sorted(qualities, reverse=True)
 
 
+def test_horizon_is_an_optional_official_single_file_model() -> None:
+    catalog = Catalog.default()
+    model = catalog.get("k2-horizon-7b-q4km")
+    assert model.modality is Modality.TEXT
+    assert model.license == "Apache-2.0"
+    assert model.shippable and model.single_file
+    assert model.url == (
+        "https://huggingface.co/IFM/K2-Horizon-7B-GGUF/resolve/main/"
+        "K2-Horizon-7B-Q4_K_M.gguf"
+    )
+    assert model.params["enable_thinking"] is False
+    assert model.params["context"] == 8192
+    assert catalog.preferred_model_id(Modality.TEXT) == "granite-4.2-8b-q4km"
+    assert ModelDescriptor.from_dict(model.to_dict()) == model
+
+
 def test_get_unknown_model_raises():
     catalog = Catalog.default()
     with pytest.raises(KeyError):

@@ -402,6 +402,7 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=EXPERIMENT / "out" / "service_smoke")
     parser.add_argument("--play", action="store_true", help="Require real speaker playback")
     parser.add_argument("--max-turns", type=int, default=12, help="Includes the opening turn")
+    parser.add_argument("--text-model", help="Cached catalog model ID; default uses catalog policy")
     args = parser.parse_args()
     if args.max_turns < 1:
         parser.error("--max-turns must be positive")
@@ -422,7 +423,7 @@ def main() -> int:
     started = time.monotonic()
     try:
         before = time.monotonic()
-        with ServiceClient(profile="voice") as client:
+        with ServiceClient(profile="voice", text_model=args.text_model) as client:
             report["service_start_s"] = time.monotonic() - before
             capabilities = client.capabilities()
             report["capabilities"] = capabilities

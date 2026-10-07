@@ -69,6 +69,22 @@ def _registry() -> ToolRegistry:
     return registry
 
 
+def test_horizon_template_options_apply_without_mutating_catalog() -> None:
+    from orchestrator.catalog import Catalog
+
+    model = Catalog.default().get("k2-horizon-7b-q4km")
+    host = TextHost(base_url="http://fake")
+    host._model = types.SimpleNamespace(descriptor=model)
+    payload = host._payload([], max_tokens=32, temperature=0, stream=True)
+    assert payload["chat_template_kwargs"] == {
+        "enable_thinking": False,
+        "tool_presentation_format": "json",
+        "tool_call_format": "json",
+    }
+    assert "enable_thinking" not in model.params["chat_template_kwargs"]
+    assert payload["stream"] is True
+
+
 def test_streams_text_and_reports_each_delta():
     host = _host_with_rounds([[_chunk(content="Hello "), _chunk(content="world")]])
     seen: list[str] = []

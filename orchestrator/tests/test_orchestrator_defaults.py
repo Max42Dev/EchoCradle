@@ -71,6 +71,23 @@ def test_public_streaming_and_listening_need_no_ids(mo, tmp_path) -> None:
         host.load.assert_called_once()
 
 
+def test_horizon_uses_existing_selection_and_reuses_loaded_model(mo) -> None:
+    model_id = "k2-horizon-7b-q4km"
+    messages = [{"role": "user", "content": "Hello"}]
+    mo.text.chat.return_value = "Hello there."
+    mo.text.stream_chat.return_value = iter(["Hello there."])
+    assert mo.chat(messages, model_id=model_id) == "Hello there."
+    assert list(mo.stream_chat(messages, model_id=model_id)) == ["Hello there."]
+    assert mo.text.loaded_model_id == model_id
+    mo.store.ensure.assert_called_once()
+    mo.text.load.assert_called_once()
+    # No override reuses the selected model, just as for every other catalog entry.
+    mo.chat(messages)
+    assert mo.text.loaded_model_id == model_id
+    mo.ensure_model(Modality.TEXT)
+    assert mo.text.loaded_model_id == "granite-4.2-8b-q4km"
+
+
 def test_voice_override_persists_until_model_switch_then_resets(mo, tmp_path) -> None:
     mo.speak("Hello.", tmp_path / "one.wav", speaker_id=9)
     mo.speak("Again.", tmp_path / "two.wav")

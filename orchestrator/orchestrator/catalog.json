@@ -100,6 +100,29 @@
             "notes": "Tier 2 default. Agentic-RL trained; best 8B for tool use. Reasoning model: needs enable_thinking=false or a large token budget."
         },
         {
+            "id": "k2-horizon-7b-q4km",
+            "modality": "text",
+            "family": "K2 Horizon",
+            "tier": 2,
+            "quality": 0.87,
+            "license": "Apache-2.0",
+            "shippable": true,
+            "url": "https://huggingface.co/IFM/K2-Horizon-7B-GGUF/resolve/main/K2-Horizon-7B-Q4_K_M.gguf",
+            "size_gb": 5.21,
+            "vram_gb": 8.5,
+            "ram_gb": 8.5,
+            "single_file": true,
+            "params": {
+                "context": 8192,
+                "enable_thinking": false,
+                "chat_template_kwargs": {
+                    "tool_presentation_format": "json",
+                    "tool_call_format": "json"
+                }
+            },
+            "notes": "Optional Tier 2 alternative to Granite. Official IFM GGUF; requires llama.cpp b11471 or newer. Resource budgets and quality are provisional; context is bounded rather than the native 512K."
+        },
+        {
             "id": "qwen3-8b-q4km",
             "modality": "text",
             "family": "Qwen3",

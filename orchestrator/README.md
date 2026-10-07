@@ -51,8 +51,21 @@ instead. Do not treat the development default as licence clearance.
 | 0 | `qwen2.5-1.5b-instruct-q4km` | 1.0 GB | Apache-2.0 |
 | 1 | `granite-4.2-3b-q4km` | 2.1 GB | Apache-2.0 |
 | 2 | `granite-4.2-8b-q4km` | 5.1 GB | Apache-2.0 |
+| 2 | `k2-horizon-7b-q4km` (experimental option) | 5.21 GiB | Apache-2.0 |
 | 2 | `qwen3-8b-q4km` | 4.7 GB | Apache-2.0 |
 | 3 | `qwen2.5-14b-instruct-q4km` | 8.4 GB | Apache-2.0 |
+
+Horizon uses the existing `model_id` override in `ModelOrchestrator` or
+`text_model` in `ServiceClient`; the interview CLI accepts
+`--text-model k2-horizon-7b-q4km`. Granite remains the default. Direct
+`ModelOrchestrator.ensure_model` provisions the selected weights on demand into
+the same shared store. Service startup remains cached-only: provision first.
+The shared text runtime is now pinned to llama.cpp **b11471**, required for
+Horizon support; this changes the runtime for Granite too and requires that
+build to be cached for service launches. Existing older cached builds are not
+deleted. Horizon's native JSON tool format is configured in the catalog.
+See [the interview comparison](../docs/HORIZON_INTERVIEW_COMPARISON.md) for its
+tool-use limitations and the invalid player-agent benchmark caveat.
 
 Speech models are CPU-only but must still fit RAM: `kokoro-en-v0_19` (TTS, 11 voices),
 `piper-en-amy-low` / `piper-en-lessac-medium` (TTS), `whisper-base-en` and

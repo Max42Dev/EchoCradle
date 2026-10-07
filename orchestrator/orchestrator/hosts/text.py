@@ -34,7 +34,8 @@ from orchestrator.paths import model_store_dir
 from orchestrator.store import InstalledModel
 
 #: Pinned llama.cpp release. Bump deliberately; the binary is ~250 MB (CUDA).
-LLAMA_CPP_BUILD = "b11284"
+# b11471 includes K2 Horizon architecture, Windows tokenizer and native tool support.
+LLAMA_CPP_BUILD = "b11471"
 LLAMA_CPP_ASSET = f"llama-{LLAMA_CPP_BUILD}-bin-win-cuda-12.4-x64.zip"
 LLAMA_CPP_URL = (
     "https://github.com/ggml-org/llama.cpp/releases/download/"
@@ -131,8 +132,11 @@ class TextHost:
         }
         if self._model is not None:
             params = self._model.descriptor.params
+            template_kwargs = dict(params.get("chat_template_kwargs", {}))
             if params.get("enable_thinking") is False:
-                payload["chat_template_kwargs"] = {"enable_thinking": False}
+                template_kwargs["enable_thinking"] = False
+            if template_kwargs:
+                payload["chat_template_kwargs"] = template_kwargs
         return payload
 
     def chat(
