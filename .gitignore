@@ -71,3 +71,7 @@ credentials.json
 
 # Generated experiment output (TTS wavs, produced configs)
 experiments/**/out/
+/out/
+
+# CodeGraph local index (per-machine database, not shared)
+.codegraph/
