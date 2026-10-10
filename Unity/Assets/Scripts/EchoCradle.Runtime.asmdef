@@ -1,0 +1,8 @@
+{
+  "name": "EchoCradle.Runtime",
+  "rootNamespace": "EchoCradle",
+  "references": [],
+  "overrideReferences": true,
+  "precompiledReferences": ["Newtonsoft.Json.dll"],
+  "autoReferenced": true
+}

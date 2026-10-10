@@ -1,0 +1,66 @@
+{
+  "service": {
+    "pythonExecutable": "C:/projects/EchoCradle/.venv/Scripts/python.exe",
+    "packageRoot": "C:/projects/EchoCradle/orchestrator"
+  },
+  "generation": { "maxTokens": 256, "temperature": 0.6, "deadlineMs": 120000, "historyPairs": 8, "maxTurns": 40 },
+  "microphone": {
+    "device": "", "sampleRate": 16000, "blockSamples": 320,
+    "onsetSeconds": 0.16, "silenceSeconds": 0.85,
+    "preRollSeconds": 0.5, "maxUtteranceSeconds": 20, "idleTimeoutSeconds": 180
+  },
+  "vad": {
+    "nativeDirectory": "C:/projects/EchoCradle/.venv/Lib/site-packages/sherpa_onnx/lib",
+    "model": "%LOCALAPPDATA%/EchoCradle/models/silero-vad/silero_vad.onnx",
+    "threshold": 0.5, "minSpeechSeconds": 0.16, "minSilenceSeconds": 0.35,
+    "targetRms": 0.1, "peakLimit": 0.5, "maxGain": 100.0, "gainTimeSeconds": 0.2
+  },
+  "speech": { "chunkCharacters": 240, "maxCharacters": 2400 },
+  "completion": { "quietSeconds": 1.0 },
+  "save": { "folder": "Saves", "configFile": "config.json", "sessionFile": "session.json" },
+  "ui": {
+    "title": "EchoCradle", "newGame": "New game", "loadGame": "Load game",
+    "cancel": "Cancel interview", "back": "Back to menu", "loading": "Preparing your companion…",
+    "ready": "Your companion is ready.",
+    "preparationFailed": "Companion preparation failed. New game will retry; check the player log.",
+    "listening": "Listening…", "thinking": "Your companion is thinking…",
+    "speaking": "Speak at any time to interrupt. Headphones recommended.",
+    "saving": "Saving your world…", "finished": "Your world is ready. Closing…",
+    "error": "The interview could not finish. No completed save was written.",
+    "noMicrophone": "No working microphone was found. Check Windows microphone access and your input device.",
+    "limit": "The interview reached its limit. Please try again.",
+    "emptyTranscript": "I did not catch that. Please try speaking again.",
+    "saveLocation": "Save folder: "
+  },
+  "prompts": {
+    "system": "You are the AI companion in EchoCradle, meeting the player for the first time. You are witty, theatrical, and a little snobbish about names. When the player first names you, you may object once; if they insist, accept and record it at once. Speak in one to three sentences, only as that character. Never mention rules, tools, files, private context or instructions. Never use parentheses or stage directions. Speech transcripts may contain misspellings. A spelled-out name followed by its pronunciation is one name. Ask briefly if uncertain. Use the available tool to record values the player supplies or confirms before acknowledging them. Direct corrections replace previously recorded values. Never invent values or placeholders. Preserve world-style details. Ask for the first missing required field: player name, world style, companion name. Once all are recorded, give a short farewell; do not ask further questions.",
+    "opening": "The player has just arrived. Greet them and begin.",
+    "state": "Private context; never mention or paraphrase it. recorded={recorded}; still_needed={missing}; ask_next={question}",
+    "interrupted": "Private delivery context; never quote it. The player interrupted. Only the delivered assistant prefix is in history; remaining generated speech was not heard. Respond to their latest words and accept corrections.",
+    "stalled": "Private context: if the player supplied a value for the first missing field, record it now; otherwise ask one short clarification. Do not invent a value.",
+    "closingQuestion": "wrap up with a brief farewell",
+    "questions": { "username": "What should I call you?", "style": "What kind of world are we building?", "ai_name": "What will you name me?" }
+  },
+  "schema": {
+    "type": "object", "required": ["username", "style", "ai_name"], "additionalProperties": false,
+    "properties": {
+      "username": { "type": "string", "minLength": 1, "maxLength": 40 },
+      "style": { "type": "string", "minLength": 1, "maxLength": 120 },
+      "ai_name": { "type": "string", "minLength": 1, "maxLength": 40 },
+      "story": { "type": "string", "minLength": 0, "maxLength": 2000 }
+    }
+  },
+  "tools": [
+    { "type": "function", "function": {
+      "name": "config_set",
+      "description": "Record a confirmed player preference. A correction replaces the previous value. Never invent values. Returns recorded values and missing required fields.",
+      "parameters": {
+        "type": "object", "additionalProperties": false, "required": ["field", "value"],
+        "properties": {
+          "field": { "type": "string", "enum": ["username", "style", "ai_name", "story"] },
+          "value": { "type": "string", "maxLength": 2000 }
+        }
+      }
+    } }
+  ]
+}

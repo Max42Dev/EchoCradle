@@ -26,13 +26,18 @@ Everything runs **locally** — no cloud APIs required.
   mcp.json                # Local MCP server configuration
 docs/
   SETUP.md                # Full environment setup guide
-Assets/                   # Unity project (created by Unity Hub)
+Unity/                    # Unity 6000.6.3f1 voice-interview prototype
 ```
 
 ## Getting Started
 
 See **[docs/SETUP.md](docs/SETUP.md)** for the complete setup guide, including
 installing Unity, Blender, Ollama, ComfyUI, and wiring up the MCP servers.
+
+For the playable black-screen menu and voice interview, open `Unity/` in Unity
+Hub and follow **[Unity/README.md](Unity/README.md)**. It uses the local model
+orchestrator, supports microphone interruptions and saves validated JSON before
+exiting. Load game is not implemented yet.
 
 ## Skills
 
