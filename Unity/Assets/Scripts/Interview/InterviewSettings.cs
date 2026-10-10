@@ -37,7 +37,7 @@ namespace EchoCradle.Interview
             Require((int)data["generation"]["deadlineMs"] >= 1000 && (int)data["generation"]["deadlineMs"] <= 120000);
             float temperature = (float)data["generation"]["temperature"];
             Require(!float.IsNaN(temperature) && temperature >= 0 && temperature <= 2);
-            Require(data["tools"] is JArray && data["prompts"] is JObject && data["ui"] is JObject);
+            Require(data["tools"] == null && data["schema"] is JObject && data["prompts"] is JObject && data["ui"] is JObject);
             return data;
         }
 

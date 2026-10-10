@@ -31,21 +31,8 @@ from typing import Any, Callable, Iterator
 from orchestrator.catalog import ModelDescriptor
 from orchestrator.hosts.base import HostError
 from orchestrator.paths import model_store_dir
+from orchestrator.runtimes import RuntimeCatalog, RuntimeDescriptor
 from orchestrator.store import InstalledModel
-
-#: Pinned llama.cpp release. Bump deliberately; the binary is ~250 MB (CUDA).
-# b11471 includes K2 Horizon architecture, Windows tokenizer and native tool support.
-LLAMA_CPP_BUILD = "b11471"
-LLAMA_CPP_ASSET = f"llama-{LLAMA_CPP_BUILD}-bin-win-cuda-12.4-x64.zip"
-LLAMA_CPP_URL = (
-    "https://github.com/ggml-org/llama.cpp/releases/download/"
-    f"{LLAMA_CPP_BUILD}/{LLAMA_CPP_ASSET}"
-)
-LLAMA_CPP_CUDA_RUNTIME = "cudart-llama-bin-win-cuda-12.4-x64.zip"
-LLAMA_CPP_CUDA_URL = (
-    "https://github.com/ggml-org/llama.cpp/releases/download/"
-    f"{LLAMA_CPP_BUILD}/{LLAMA_CPP_CUDA_RUNTIME}"
-)
 
 
 class TextHost:
@@ -62,6 +49,7 @@ class TextHost:
         context: int = 4096,
         startup_timeout_s: float = 180.0,
         binary_dir: Path | None = None,
+        runtime: RuntimeDescriptor | None = None,
     ) -> None:
         #: When ``base_url`` is set the host talks to an *external* server
         #: (e.g. a running Ollama) and never spawns a process.
@@ -70,7 +58,8 @@ class TextHost:
         self.n_gpu_layers = n_gpu_layers
         self.context = context
         self.startup_timeout_s = startup_timeout_s
-        self.binary_dir = binary_dir or (model_store_dir() / "llama.cpp" / LLAMA_CPP_BUILD)
+        self.runtime = runtime if runtime is not None else RuntimeCatalog.default().get("llama.cpp")
+        self.binary_dir = binary_dir or self.runtime.cache_dir(model_store_dir())
         self._process: subprocess.Popen | None = None
         self._model: InstalledModel | None = None
 
@@ -579,11 +568,12 @@ class TextHost:
 
     def _ensure_binary(self) -> Path:
         """Download and extract llama-server if it is not already present."""
-        exe = self.binary_dir / "llama-server.exe"
-        if exe.exists():
-            return exe
+        exe = self.binary_dir / self.runtime.executable
+        cached = next(self.binary_dir.rglob(self.runtime.executable), None)
+        if cached is not None and cached.is_file():
+            return cached
         self.binary_dir.mkdir(parents=True, exist_ok=True)
-        for url in (LLAMA_CPP_URL, LLAMA_CPP_CUDA_URL):
+        for url in self.runtime.archives:
             archive = self.binary_dir / Path(url).name
             _download(url, archive)
             with zipfile.ZipFile(archive) as zf:
@@ -591,9 +581,9 @@ class TextHost:
             archive.unlink(missing_ok=True)
         if not exe.exists():
             # Some builds nest the binaries one level down.
-            found = next(self.binary_dir.rglob("llama-server.exe"), None)
+            found = next(self.binary_dir.rglob(self.runtime.executable), None)
             if found is None:
-                raise HostError("llama-server.exe not found after extraction")
+                raise HostError(f"{self.runtime.executable} not found after extraction")
             return found
         return exe
 

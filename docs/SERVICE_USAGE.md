@@ -25,6 +25,24 @@ same store fails with `STORE_BUSY`. Missing selected weights/runtime fail with
 `MODEL_NOT_PROVISIONED`; do not expect automatic selection of a cached substitute.
 Provisioning is not a service endpoint in this slice.
 
+### External configuration
+
+The service accepts `--runtime-config PATH` for native engine deployments and
+`--model-catalog PATH` for model descriptors/preferences across text, TTS and STT.
+Alternatively set `ECHOCRADLE_RUNTIME_CONFIG` and `ECHOCRADLE_MODEL_CATALOG`;
+owned Python/Unity service processes inherit these environment variables.
+Explicit CLI paths override environment paths; otherwise packaged JSON is used.
+Configuration is trusted local operator input, never a job field or model output.
+Overrides replace the complete file and require a service restart.
+
+The default native runtime is pinned in `orchestrator/runtimes.json` to llama.cpp
+`b11471`, variant `win-cuda-12.4-x64`. Its cache is now
+`models/llama.cpp/b11471/win-cuda-12.4-x64/`, including executable and DLLs.
+Old flat version directories are not searched; relocate their complete extracted
+runtime files into the variant directory or provision it outside the service.
+Changing config does not provision assets; uncached selections still fail.
+See [configuration details](../orchestrator/README.md#external-model-and-runtime-configuration).
+
 Default catalog preferences, subject to licence, individual memory fit and
 eligibility, are Granite `granite-4.2-8b-q4km`, Kokoro `kokoro-en-v0_19` (speaker
 7, `bf_emma`) and SenseVoice `sensevoice-small`. SenseVoice is offline/final-only

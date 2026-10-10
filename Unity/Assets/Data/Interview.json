@@ -49,18 +49,5 @@
       "ai_name": { "type": "string", "minLength": 1, "maxLength": 40 },
       "story": { "type": "string", "minLength": 0, "maxLength": 2000 }
     }
-  },
-  "tools": [
-    { "type": "function", "function": {
-      "name": "config_set",
-      "description": "Record a confirmed player preference. A correction replaces the previous value. Never invent values. Returns recorded values and missing required fields.",
-      "parameters": {
-        "type": "object", "additionalProperties": false, "required": ["field", "value"],
-        "properties": {
-          "field": { "type": "string", "enum": ["username", "style", "ai_name", "story"] },
-          "value": { "type": "string", "maxLength": 2000 }
-        }
-      }
-    } }
-  ]
+  }
 }

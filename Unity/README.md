@@ -26,9 +26,46 @@ Closing the application from the menu also shuts down its owned service.
 
 ## Configuration
 
-`Assets/Data/Interview.json` contains all interview prompts, tool declarations,
+`Assets/Data/Interview.json` contains all interview prompts,
 the string-field JSON schema, UI text, generation bounds, voice settings and
 save filenames. `Assets/Data/InterviewSettings.asset` references that document.
+
+### Source-defined tools with the official MCP SDK
+
+`InterviewState.RecordPreference` is the typed tool implementation. Its source
+contains the standard `[McpServerTool]` and `[Description]` metadata; argument
+names/types come from the method signature. Tool JSON no longer lives in the
+interview configuration. Allowed preference fields and value bounds are derived
+from the document schema when constructing a session.
+
+`tools/ToolDefinitions` compiles the shared domain source with the pinned official
+`ModelContextProtocol.Core` **2.2.0** SDK. `McpServerTool.Create` generates the
+declarations, and the utility emits direct typed bindings for Unity. From the
+repository root, regenerate after changing the domain source:
+
+`dotnet run --project tools/ToolDefinitions/ToolDefinitions.csproj`
+
+For CI, verify the committed artifact without writing:
+
+`dotnet run --project tools/ToolDefinitions/ToolDefinitions.csproj -- --check`
+
+Requires local .NET 10; NuGet dependencies are pinned in `packages.lock.json`.
+Use `dotnet restore tools/ToolDefinitions/ToolDefinitions.csproj --locked-mode`
+in CI. Unity Play and player builds reject stale source fingerprints. Commit
+the generated `.g.cs` with its source change; never hand-maintain its declaration.
+The current generator deliberately supports required string arguments and
+synchronous `JObject` results only; unsupported signatures fail generation.
+
+The official SDK runs **only during generation**, not in the Unity player.
+Invocation uses direct calls, so no runtime reflection or linker preservation is
+needed. The SDK's Unity/IL2CPP runtime compatibility has not been certified here.
+Existing active-turn validation, session revocation, thread safety and value
+validation remain authoritative; a generated schema is not a security boundary.
+
+This is official-SDK tool-definition integration, **not an MCP network endpoint**.
+The game continues using the orchestrator's authenticated REST/WebSocket protocol;
+it adapts MCP tool metadata to the existing function-declaration format without
+adding a second server or replacing the model/audio transport.
 
 Set `service.pythonExecutable` to an absolute existing Python executable.
 `service.packageRoot` must contain `orchestrator/service.py`. The default is an

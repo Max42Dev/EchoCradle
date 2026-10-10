@@ -175,7 +175,7 @@ namespace EchoCradle.Interview
                 await _preparation;
                 token.ThrowIfCancellationRequested();
                 if (!_companionReady || _owner == null) throw new InvalidOperationException("COMPANION_NOT_READY");
-                await _owner.Client.ResetSessionAsync((JArray)_config["tools"], _state.SessionHandler(), token);
+                await _owner.Client.ResetSessionAsync(_state.ToolDeclarations(), _state.SessionHandler(), token);
                 SileroDetector vad = await Task.Run(() => new SileroDetector((JObject)_config["vad"]), token);
                 if (token.IsCancellationRequested) { vad.Dispose(); token.ThrowIfCancellationRequested(); }
                 try { _microphone = new MicrophoneCapture((JObject)_config["microphone"], vad); }
@@ -233,7 +233,7 @@ namespace EchoCradle.Interview
                         }
                     }
                     if (_interrupted)
-                        await _owner.Client.ResetSessionAsync((JArray)_config["tools"], _state.SessionHandler(), token);
+                        await _owner.Client.ResetSessionAsync(_state.ToolDeclarations(), _state.SessionHandler(), token);
                     string transcript = await ListenAsync(token);
                     _player = transcript;
                     history.Add(InterviewState.Message("user", transcript));

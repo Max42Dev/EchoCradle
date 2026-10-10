@@ -10,6 +10,7 @@ to refuse non-commercial weights in a shipped build (exp. 0103/0104).
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -147,6 +148,7 @@ class Catalog:
         )
 
     @classmethod
-    def default(cls) -> Catalog:
-        """Load the catalog shipped with the package."""
-        return cls.from_json(Path(__file__).with_name("catalog.json"))
+    def default(cls, path: str | Path | None = None) -> Catalog:
+        """Explicit path, then environment override, then the packaged defaults."""
+        selected = path or os.environ.get("ECHOCRADLE_MODEL_CATALOG")
+        return cls.from_json(selected or Path(__file__).with_name("catalog.json"))

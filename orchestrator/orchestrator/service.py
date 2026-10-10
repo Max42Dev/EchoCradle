@@ -32,9 +32,10 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from orchestrator.catalog import Modality, ModelDescriptor
+from orchestrator.catalog import Catalog, Modality, ModelDescriptor
 from orchestrator.hosts.text import TextHost
 from orchestrator.paths import model_store_dir
+from orchestrator.runtimes import RuntimeCatalog
 from orchestrator.service_protocol import (
     ARTIFACT_LIMIT, JSON_LIMIT, PCM_LIMIT,
     PROTOCOL_VERSION, TERMINAL, TOOL_LIMIT, TTL_SECONDS, JobSpec, ServiceError,
@@ -57,6 +58,8 @@ class ServiceConfig:
     speaker_id: int | None = None
     port: int = 0
     store_root: Path | None = None
+    runtime_config: Path | None = None
+    model_catalog: Path | None = None
     allowed_origins: tuple[str, ...] = ()
     spawned_owner: bool = True
 
@@ -90,9 +93,9 @@ class CachedTextHost(TextHost):
     """The real text host, with its implicit llama.cpp download disabled."""
 
     def _ensure_binary(self) -> Path:
-        executable = self.binary_dir / "llama-server.exe"
+        executable = self.binary_dir / self.runtime.executable
         if not executable.is_file():
-            executable = next(self.binary_dir.rglob("llama-server.exe"), executable)
+            executable = next(self.binary_dir.rglob(self.runtime.executable), executable)
         if not executable.is_file():
             raise ServiceError(
                 "MODEL_NOT_PROVISIONED", "The local text runtime is not cached.", 503,
@@ -433,12 +436,18 @@ class _Runtime:
         self.store_lock.acquire()
         self.facade = ModelOrchestrator(
             store=CachedModelStore(root), shippable_only=self.config.shippable_only,
+            catalog=Catalog.default(self.config.model_catalog),
+            runtimes=RuntimeCatalog.default(self.config.runtime_config),
         )
         # Avoid a fixed 8080 runtime port colliding with the public listener.
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as temporary:
             temporary.bind(("127.0.0.1", 0))
             runtime_port = temporary.getsockname()[1]
-        host = CachedTextHost(port=runtime_port, context=4096, startup_timeout_s=90)
+        runtime = self.facade.runtimes.get("llama.cpp")
+        host = CachedTextHost(
+            port=runtime_port, context=4096, startup_timeout_s=90,
+            runtime=runtime, binary_dir=runtime.cache_dir(root),
+        )
         self.facade.text = host
         self.facade._hosts[Modality.TEXT] = host
         diagnostics = {"probe": self.facade.report.to_dict(), "planned": {}, "actual": {}}
@@ -1185,6 +1194,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tts-model")
     parser.add_argument("--stt-model")
     parser.add_argument("--speaker-id", type=int)
+    parser.add_argument("--runtime-config", type=Path)
+    parser.add_argument("--model-catalog", type=Path)
     args = parser.parse_args(argv)
     bootstrap = sys.stdout
     # All dependency/native prints and uvicorn/access logs go to stderr.

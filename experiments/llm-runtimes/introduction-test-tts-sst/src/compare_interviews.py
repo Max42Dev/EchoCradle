@@ -21,7 +21,7 @@ from config_schema import CONFIG_SCHEMA
 from interview import Interview
 from orchestrator.catalog import Catalog
 from orchestrator.client import ServiceClient
-from orchestrator.hosts.text import LLAMA_CPP_BUILD, TextHost
+from orchestrator.hosts.text import TextHost
 from orchestrator.store import ModelStore
 from orchestrator.tools import JsonConfigTool, ToolRegistry
 
@@ -145,7 +145,7 @@ def main() -> int:
         parser.error("The fixed player model must already be cached")
     player = TextHost(port=8081)
     summary: dict[str, Any] = {
-        "runtime": LLAMA_CPP_BUILD, "player_model": PLAYER_MODEL,
+        "runtime": player.runtime.version, "player_model": PLAYER_MODEL,
         "voice": False, "microphone": False, "max_turns": args.max_turns,
         "player_temperature": 0.4, "interviewer_temperature": 0.4,
         "seed_policy": "player seed 7100 + scenario_index*100 + turn_index",

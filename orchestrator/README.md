@@ -74,6 +74,39 @@ TTS loads its model-specific catalog voice, or speaker 0 if absent/invalid.
 An explicit speaker override persists for the loaded model; switching models
 resets it to the new model's default, so a one-speaker Piper fallback uses 0.
 
+## External model and runtime configuration
+
+Model weights, URLs, preferences and host-specific parameters remain in
+`orchestrator/catalog.json` for **all supported modalities**. Native text engine
+deployments (version, hardware variant, executable and ZIP URLs) now live in
+`orchestrator/runtimes.json`, not `hosts/text.py`.
+
+Set `ECHOCRADLE_MODEL_CATALOG` or `ECHOCRADLE_RUNTIME_CONFIG` to an external JSON
+file. The standalone service also accepts `--model-catalog PATH` and
+`--runtime-config PATH`; explicit paths take precedence over environment variables,
+which take precedence over packaged defaults. Owned clients inherit the environment.
+Files are loaded when constructing the facade/host or starting the service profile;
+restart after editing them. Invalid overrides fail rather than silently reverting.
+
+Copy the complete default file before editing; overrides replace it, not merge it.
+To update a model, edit its catalog descriptor (prefer a new model ID for new weights)
+and the appropriate `preferred_models` entry. To update llama.cpp, edit the pinned
+`version` and archive URLs together, plus `variant` if the hardware build changes.
+Do not select `latest`: runtime compatibility must be tested before deployment.
+
+Runtime binaries are cached under `models/<runtime-id>/<version>/<variant>/`.
+The variant subdirectory is new: existing flat `models/llama.cpp/b11471/` caches
+are **not** used. Re-provision, or manually relocate the already extracted runtime
+files into `models/llama.cpp/b11471/win-cuda-12.4-x64/` (including companion DLLs).
+The service remains cached-only and never downloads missing binaries or weights.
+Direct experiment hosts may provision the configured archives as before.
+
+These files are trusted operator configuration: runtime archives contain native
+executables. HTTPS/path validation does not establish publisher trust; only use
+verified release sources. Python dependencies such as `sherpa-onnx` remain in
+`pyproject.toml` and must be updated through the Python environment, not JSON.
+No unimplemented image/3D/audio runtime entries are invented.
+
 ## Install
 
 ```powershell

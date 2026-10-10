@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
+using EchoCradle.Interview;
 using EchoCradle.Orchestration;
 using Newtonsoft.Json.Linq;
 using NUnit.Framework;
@@ -20,10 +21,13 @@ public sealed class RealOrchestratorTests
             try
             {
                 int calls = 0;
-                await owner.Client.OpenSessionAsync((JArray)config["tools"], (name, arguments) =>
+                var state = new InterviewState((JObject)config["schema"]);
+                state.AcceptTools(true);
+                var handler = state.SessionHandler();
+                await owner.Client.OpenSessionAsync(state.ToolDeclarations(), (name, arguments) =>
                 {
                     Interlocked.Increment(ref calls);
-                    return new JObject { ["recorded"] = arguments.DeepClone() };
+                    return handler(name, arguments);
                 }, stop.Token);
                 string response = await owner.Client.DialogueAsync(new JArray
                 {
@@ -32,6 +36,7 @@ public sealed class RealOrchestratorTests
                 }, 128, 0.2f, 120000, null, stop.Token);
                 Assert.That(response, Is.Not.Empty);
                 Assert.That(calls, Is.GreaterThan(0), "Expected a real native tool round trip.");
+                Assert.That((string)state.Snapshot()["username"], Is.EqualTo("Ada"));
                 await owner.Client.ResetSessionAsync(new JArray(), null, stop.Token);
                 PcmAudio audio = await owner.Client.SynthesizeAsync("The service is ready.", stop.Token);
                 Assert.That(audio.Samples.Length, Is.GreaterThan(0));

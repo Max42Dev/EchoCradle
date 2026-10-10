@@ -1,6 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using Newtonsoft.Json.Linq;
+#if ECHOCRADLE_TOOL_GENERATOR
+using ModelContextProtocol.Server;
+#endif
 
 namespace EchoCradle.Interview
 {
@@ -41,7 +45,7 @@ namespace EchoCradle.Interview
             return (name, arguments) =>
             {
                 lock (_sync)
-                    return generation == _generation ? Invoke(name, arguments) :
+                    return generation == _generation ? InterviewToolBindings.Invoke(this, name, arguments) :
                         new JObject { ["error"] = "stale_session" };
             };
         }
@@ -58,20 +62,41 @@ namespace EchoCradle.Interview
             }
         }
 
-        public JObject Invoke(string name, JObject arguments)
+        /// <summary>Source-defined tool; SDK metadata is compiled by the local generator only.</summary>
+#if ECHOCRADLE_TOOL_GENERATOR
+        [McpServerTool(Name = "config_set", Destructive = true, Idempotent = true, OpenWorld = false)]
+#endif
+        [Description("Record a confirmed player preference. A correction replaces the previous value. Never invent values. Returns recorded values and missing required fields.")]
+        public JObject RecordPreference(
+            [Description("The configured player preference field to record.")] string field,
+            [Description("The value supplied or confirmed by the player.")] string value)
         {
             lock (_sync)
             {
                 if (!_accepting) return new JObject { ["error"] = "turn_cancelled" };
-                if (name != "config_set" || arguments.Count != 2 || arguments["field"]?.Type != JTokenType.String ||
-                    arguments["value"]?.Type != JTokenType.String)
-                    return new JObject { ["error"] = "invalid_arguments" };
-                string field = (string)arguments["field"];
-                string value = ((string)arguments["value"]).Trim();
+                if (field == null || value == null) return new JObject { ["error"] = "invalid_arguments" };
+                value = value.Trim();
                 if (!Valid(field, value)) return new JObject { ["error"] = "invalid_field_value" };
                 _values[field] = value;
                 return new JObject { ["recorded"] = Snapshot(), ["missing"] = Missing() };
             }
+        }
+
+        public JArray ToolDeclarations()
+        {
+            JArray tools = InterviewToolBindings.Declarations();
+            // Domain constraints stay data-driven, not duplicated in tool metadata.
+            var fields = new JArray();
+            int maximum = 0;
+            foreach (JProperty property in ((JObject)_schema["properties"]).Properties())
+            {
+                fields.Add(property.Name);
+                maximum = Math.Max(maximum, (int)property.Value["maxLength"]);
+            }
+            JObject parameters = (JObject)tools[0]["function"]["parameters"]["properties"];
+            parameters["field"]["enum"] = fields;
+            parameters["value"]["maxLength"] = maximum;
+            return tools;
         }
 
         private bool Valid(string field, string value)

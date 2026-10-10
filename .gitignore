@@ -11,6 +11,7 @@
 
 # Unity IDE files
 *.csproj
+!/tools/ToolDefinitions/*.csproj
 *.unityproj
 *.sln
 *.suo
@@ -75,3 +76,7 @@ experiments/**/out/
 
 # CodeGraph local index (per-machine database, not shared)
 .codegraph/
+
+# Local .NET tooling outputs
+tools/**/bin/
+tools/**/obj/

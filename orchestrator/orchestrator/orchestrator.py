@@ -31,6 +31,7 @@ from orchestrator.hosts.text import TextHost
 from orchestrator.paths import cache_dir
 from orchestrator.planner import Planner
 from orchestrator.probe import ProbeReport, probe
+from orchestrator.runtimes import RuntimeCatalog
 from orchestrator.store import ModelStore
 
 log = logging.getLogger("orchestrator")
@@ -48,6 +49,7 @@ class ModelOrchestrator:
         text_base_url: str | None = None,
         shippable_only: bool = False,
         cache: Path | None = None,
+        runtimes: RuntimeCatalog | None = None,
     ) -> None:
         self.catalog = catalog if catalog is not None else Catalog.default()
         self.store = store or ModelStore()
@@ -56,7 +58,8 @@ class ModelOrchestrator:
         self.shippable_only = shippable_only
         self.cache = cache or cache_dir()
 
-        self.text = TextHost(base_url=text_base_url)
+        self.runtimes = runtimes if runtimes is not None else RuntimeCatalog.default()
+        self.text = TextHost(base_url=text_base_url, runtime=self.runtimes.get("llama.cpp"))
         self.tts = TtsHost()
         self.stt = SttHost()
 
@@ -111,8 +114,7 @@ class ModelOrchestrator:
             temporary = path.with_suffix(".part")
             try:
                 request = urllib.request.Request(
-                    "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
-                    "asr-models/silero_vad.onnx"
+                    self.catalog.get("silero-vad").url
                 )
                 with urllib.request.urlopen(request, timeout=30) as response:
                     payload = response.read(2 * 1024 * 1024 + 1)

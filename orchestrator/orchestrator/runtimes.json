@@ -1,0 +1,14 @@
+{
+    "runtimes": [
+        {
+            "id": "llama.cpp",
+            "version": "b11471",
+            "variant": "win-cuda-12.4-x64",
+            "executable": "llama-server.exe",
+            "archives": [
+                "https://github.com/ggml-org/llama.cpp/releases/download/b11471/llama-b11471-bin-win-cuda-12.4-x64.zip",
+                "https://github.com/ggml-org/llama.cpp/releases/download/b11471/cudart-llama-bin-win-cuda-12.4-x64.zip"
+            ]
+        }
+    ]
+}
