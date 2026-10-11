@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using System.Threading;
@@ -25,7 +26,7 @@ namespace EchoCradle.Interview
         private Task _shutdown;
         private bool _companionReady;
         private string _preparationStatus;
-        private byte[] _pendingAudio;
+        private readonly Queue<byte[]> _pendingAudio = new Queue<byte[]>(2);
         private bool _running, _interrupted, _quitting, _error;
         private bool _destroyed;
         private string _status, _subtitle = "", _player = "", _saveFolder = "";
@@ -33,6 +34,8 @@ namespace EchoCradle.Interview
         private readonly StringBuilder _delivered = new StringBuilder();
         private string _playingText;
         private AudioClip _playingClip;
+        private string _audioDiagnosticsDirectory;
+        private int _microphoneDiagnosticIndex, _playbackDiagnosticIndex;
         private GUIStyle _titleStyle, _textStyle, _statusStyle, _buttonStyle;
 
         private void Awake()
@@ -42,6 +45,13 @@ namespace EchoCradle.Interview
             _audio.spatialBlend = 0;
             Application.runInBackground = true;
             _config = settings.Read();
+            _audioDiagnosticsDirectory = Environment.GetEnvironmentVariable("ECHOCRADLE_AUDIO_DIAGNOSTICS");
+            if (!string.IsNullOrEmpty(_audioDiagnosticsDirectory))
+            {
+                _audioDiagnosticsDirectory = Path.GetFullPath(Path.Combine(_audioDiagnosticsDirectory,
+                    DateTime.UtcNow.ToString("yyyyMMdd-HHmmss") + "-" + Guid.NewGuid().ToString("N")));
+                Debug.Log("Opt-in speech diagnostics: " + _audioDiagnosticsDirectory);
+            }
             Application.wantsToQuit += WantsToQuit;
             _preparation = PrepareCompanionAsync();
         }
@@ -120,6 +130,15 @@ namespace EchoCradle.Interview
 
         private void Update()
         {
+            if (_running && _turn != null && _state.IsComplete)
+            {
+                // Field completion wins over playback, pending microphone work and further turns.
+                _state.AcceptTools(false);
+                StopMicrophone();
+                _audio.Stop();
+                _turn.Cancel();
+                return;
+            }
             if (_microphone == null) return;
             try { _microphone.Poll(); }
             catch (Exception)
@@ -143,15 +162,15 @@ namespace EchoCradle.Interview
 
         private void Captured(byte[] pcm)
         {
-            // One utterance slot, fail explicitly instead of silently losing subsequent speech.
-            if (_pendingAudio != null)
+            // Preserve consecutive utterances while STT/reset is awaiting the service.
+            if (_pendingAudio.Count >= 2)
             {
                 _error = true;
                 _status = Ui("limit");
                 Cancel();
                 return;
             }
-            _pendingAudio = pcm;
+            _pendingAudio.Enqueue(pcm);
             Debug.Log("Microphone utterance captured: " + (pcm.Length / 32000f).ToString("F2") + " seconds.");
         }
 
@@ -161,7 +180,7 @@ namespace EchoCradle.Interview
             CancellationToken token = _lifetime.Token;
             bool complete = false;
             _subtitle = _player = _saveFolder = "";
-            _pendingAudio = null;
+            _pendingAudio.Clear();
             try
             {
                 _status = Ui("loading");
@@ -182,6 +201,15 @@ namespace EchoCradle.Interview
                 catch { vad.Dispose(); throw; }
                 _microphone.SpeechStarted += SpeechStarted;
                 _microphone.Utterance += Captured;
+                _status = Ui("calibrating");
+                float calibrationDeadline = Time.realtimeSinceStartup + 10;
+                while (!_microphone.IsCalibrated)
+                {
+                    if (Time.realtimeSinceStartup >= calibrationDeadline)
+                        throw new InvalidOperationException("MICROPHONE_UNAVAILABLE");
+                    await Awaitable.NextFrameAsync(token);
+                }
+                Debug.Log("Microphone noise-floor calibration completed.");
                 var history = new JArray();
                 bool interruptedContext = false;
                 string previousMissing = null;
@@ -190,8 +218,14 @@ namespace EchoCradle.Interview
                 {
                     token.ThrowIfCancellationRequested();
                     // Onset during STT/reset has no active turn to cancel. Consume that speech first.
-                    if (_pendingAudio != null || _microphone.IsSpeaking)
+                    while (_pendingAudio.Count > 0 || _microphone.HasPendingAudio)
                     {
+                        if (_pendingAudio.Count == 0 && !_microphone.IsSpeaking)
+                        {
+                            // Wait for queued/in-flight VAD before admitting a new assistant turn.
+                            await Awaitable.NextFrameAsync(token);
+                            continue;
+                        }
                         string extra = await ListenAsync(token);
                         history.Add(InterviewState.Message("user", extra));
                         _player = extra;
@@ -206,7 +240,8 @@ namespace EchoCradle.Interview
                     previousMissing = missing;
                     JArray messages = _state.Messages(history, (JObject)_config["prompts"], interruptedContext, stalled >= 2);
                     try { await SpeakTurnAsync(messages, _turn.Token); }
-                    catch (OperationCanceledException) when (_interrupted && !token.IsCancellationRequested) { }
+                    catch (OperationCanceledException) when ((_interrupted || _state.IsComplete) && !token.IsCancellationRequested) { }
+                    catch (OrchestratorException) when (_state.IsComplete && !token.IsCancellationRequested) { }
                     finally
                     {
                         _state.AcceptTools(false);
@@ -217,20 +252,16 @@ namespace EchoCradle.Interview
                     token.ThrowIfCancellationRequested();
                     if (_delivered.Length > 0) history.Add(InterviewState.Message("assistant", _delivered.ToString().Trim()));
                     interruptedContext = _interrupted;
-                    if (!_interrupted && _state.Missing().Count == 0)
+                    if (_state.IsComplete)
                     {
-                        // Give onset detection and the worker hand-off a final quiet boundary.
-                        float quietUntil = Time.realtimeSinceStartup + (float)_config["completion"]["quietSeconds"];
-                        while (Time.realtimeSinceStartup < quietUntil && _pendingAudio == null && !_microphone.IsSpeaking)
-                            await Awaitable.NextFrameAsync(token);
-                        if (_pendingAudio == null && !_microphone.HasPendingAudio)
-                        {
-                            _status = Ui("saving");
-                            StopMicrophone();
-                            await save.CompleteAsync(_state.Snapshot(), _state, token);
-                            complete = true;
-                            break;
-                        }
+                        _status = Ui("saving");
+                        StopMicrophone();
+                        _audio.Stop();
+                        _pendingAudio.Clear();
+                        await save.CompleteAsync(_state.Snapshot(), _state, token);
+                        Debug.Log("Interview completed: all required fields recorded; save ready.");
+                        complete = true;
+                        break;
                     }
                     if (_interrupted)
                         await _owner.Client.ResetSessionAsync(_state.ToolDeclarations(), _state.SessionHandler(), token);
@@ -285,17 +316,23 @@ namespace EchoCradle.Interview
             {
                 _status = Ui("listening");
                 float started = Time.realtimeSinceStartup;
-                while (_pendingAudio == null)
+                while (_pendingAudio.Count == 0)
                 {
                     token.ThrowIfCancellationRequested();
                     if (Time.realtimeSinceStartup - started > (int)_config["microphone"]["idleTimeoutSeconds"])
                         throw new TimeoutException();
                     await Awaitable.NextFrameAsync(token);
                 }
-                byte[] pcm = _pendingAudio;
-                _pendingAudio = null;
+                byte[] pcm = _pendingAudio.Dequeue();
                 _status = Ui("thinking");
+                string diagnosticName = "microphone-" + (++_microphoneDiagnosticIndex).ToString("D3");
+                if (!string.IsNullOrEmpty(_audioDiagnosticsDirectory))
+                    await SpeechDiagnostics.WriteAsync(_audioDiagnosticsDirectory, diagnosticName, pcm, 16000);
+                token.ThrowIfCancellationRequested();
                 string transcript = await _owner.Client.TranscribeAsync(pcm, token);
+                token.ThrowIfCancellationRequested();
+                if (!string.IsNullOrEmpty(_audioDiagnosticsDirectory))
+                    await SpeechDiagnostics.WriteAsync(_audioDiagnosticsDirectory, diagnosticName, pcm, 16000, transcript);
                 token.ThrowIfCancellationRequested();
                 Debug.Log("Microphone STT completed: " + transcript.Length + " characters (content not logged).");
                 if (!string.IsNullOrWhiteSpace(transcript)) return transcript;
@@ -308,17 +345,30 @@ namespace EchoCradle.Interview
             JObject generation = (JObject)_config["generation"];
             var chunks = new SpeechChunks((int)_config["speech"]["chunkCharacters"], (int)_config["speech"]["maxCharacters"]);
             _status = Ui("thinking");
-            Task<string> dialogue = _owner.Client.DialogueAsync(messages, (int)generation["maxTokens"],
+            Task<OrchestratorJob> dialogue = _owner.Client.TextAsync(messages, (int)generation["maxTokens"],
                 (float)generation["temperature"], (int)generation["deadlineMs"], chunks.Add, token);
             bool flushed = false;
             try
             {
                 while (true)
                 {
+                    if (_state.IsComplete)
+                    {
+                        _state.AcceptTools(false);
+                        _audio.Stop();
+                        return;
+                    }
                     token.ThrowIfCancellationRequested();
                     if (dialogue.IsCompleted && !flushed)
                     {
-                        await dialogue; // Observe failures before using further generated speech.
+                        OrchestratorJob final = await dialogue;
+                        foreach (OrchestratorToolCall call in final.Calls)
+                            Debug.Log("Interview tool: " + call.Name + "; outcome=" + call.Outcome +
+                                "; executed=" + call.LocallyExecuted + "; delivered=" + call.ResultDelivered);
+                        Debug.Log("Interview turn: " + final.State + "; tool calls=" + final.Calls.Count +
+                            "; missing fields=" + _state.Missing().Count);
+                        if (final.State == "cancelled") throw new OperationCanceledException(token);
+                        if (final.State != "succeeded") throw (Exception)final.Error ?? new InvalidOperationException("TEXT_FAILED");
                         chunks.Flush();
                         flushed = true;
                     }
@@ -329,6 +379,10 @@ namespace EchoCradle.Interview
                         continue;
                     }
                     PcmAudio pcm = await _owner.Client.SynthesizeAsync(text, token);
+                    token.ThrowIfCancellationRequested();
+                    if (!string.IsNullOrEmpty(_audioDiagnosticsDirectory) && pcm.Samples.Length > 0)
+                        await SpeechDiagnostics.WriteAsync(_audioDiagnosticsDirectory,
+                            "companion-" + (++_playbackDiagnosticIndex).ToString("D3"), pcm.Samples, pcm.SampleRate, text);
                     token.ThrowIfCancellationRequested();
                     float[] samples = await Task.Run(() =>
                     {

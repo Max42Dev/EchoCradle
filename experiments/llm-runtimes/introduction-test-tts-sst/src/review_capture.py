@@ -9,7 +9,8 @@ from typing import Any
 
 import numpy as np
 
-from main import ModelOrchestrator, Modality, write_wav
+from main import write_wav
+from orchestrator import ModelOrchestrator, Modality
 from orchestrator.hosts.speech import normalise_audio, read_wav, trim_silence
 
 

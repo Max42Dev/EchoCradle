@@ -11,7 +11,8 @@ from pathlib import Path
 import numpy as np
 import sounddevice as sd
 
-from main import ModelOrchestrator, Modality, write_wav
+from main import write_wav
+from orchestrator import ModelOrchestrator, Modality
 
 
 def main() -> int:

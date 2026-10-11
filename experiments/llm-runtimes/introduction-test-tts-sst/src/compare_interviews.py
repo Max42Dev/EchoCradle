@@ -10,7 +10,6 @@ import argparse
 import json
 import sys
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +17,7 @@ import jsonschema
 
 from comparison_prompts import PLAYER_SYSTEM, SCENARIOS
 from config_schema import CONFIG_SCHEMA
+from consumer_results import json_value
 from interview import Interview
 from orchestrator.catalog import Catalog
 from orchestrator.client import ServiceClient
@@ -34,7 +34,8 @@ PLAYER_SCHEMA = {
 
 
 def save(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(json_value(value), indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8")
 
 
 def evaluate(config: dict[str, Any], scenario: dict[str, Any]) -> dict[str, bool]:
@@ -95,8 +96,10 @@ def run_case(
                 "player": reply, "assistant": result.say, "config": result.config,
                 "seconds": time.monotonic() - before, "repaired": result.repaired,
                 "interrupted": interrupted, "validation_errors": result.validation_errors,
-                "tool_calls": [asdict(call) for call in result.tool_calls],
+                "tool_calls": json_value(result.tool_calls),
             })
+            if interrupted:
+                raise RuntimeError("Comparison interview was cancelled")
             history.append({"role": "user", "content": result.say})
             if interview.complete and first_complete_turn is None:
                 first_complete_turn = turn
@@ -156,7 +159,7 @@ def main() -> int:
         player.load(player_model)
         for model_id in MODELS:
             cases = []
-            with ServiceClient(profile="text", text_model=model_id) as client:
+            with ServiceClient.start_owned(profile="text", text_model=model_id) as client:
                 capabilities = client.capabilities()
                 for index, scenario in enumerate(SCENARIOS):
                     path = args.out / f"{model_id}_{index + 1:02d}.json"

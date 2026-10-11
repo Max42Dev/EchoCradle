@@ -73,6 +73,33 @@ namespace EchoCradle.Orchestration
             return (string)value;
         }
 
+        internal static string NullableId(JToken value)
+        {
+            if (value == null) throw new OrchestratorException("PROTOCOL_ERROR");
+            return value.Type == JTokenType.Null ? null : Id(value);
+        }
+
+        internal static bool Boolean(JToken value)
+        {
+            if (value?.Type != JTokenType.Boolean) throw new OrchestratorException("PROTOCOL_ERROR");
+            return (bool)value;
+        }
+
+        internal static OrchestratorException Error(JObject error, int? status, string phase, string job = null)
+        {
+            if (error == null) throw new OrchestratorException("PROTOCOL_ERROR", status, phase: phase);
+            string code = Text(error["code"], 64);
+            if (code.Length == 0) throw new OrchestratorException("PROTOCOL_ERROR", status, phase: phase);
+            foreach (char c in code)
+                if (!(c >= 'A' && c <= 'Z') && c != '_' && !(c >= '0' && c <= '9'))
+                    throw new OrchestratorException("PROTOCOL_ERROR", status, phase: phase);
+            Text(error["message"], 4096); // Validate, but never retain remote prose.
+            bool retryable = Boolean(error["retryable"]);
+            string correlated = NullableId(error["job_id"]);
+            if (job != null && correlated != job) throw new OrchestratorException("PROTOCOL_ERROR");
+            return new OrchestratorException(code, status, retryable, correlated, phase);
+        }
+
         private static void Validate(JToken value, int depth)
         {
             if (depth > 16) throw new OrchestratorException("INVALID_JSON");

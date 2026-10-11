@@ -1,6 +1,7 @@
 """Response-schema wire contract and server forwarding, without native models."""
 
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -18,9 +19,12 @@ SCHEMA = {
 def test_client_forwards_schema() -> None:
     client = object.__new__(ServiceClient)
     submitted = []
-    client._submit = lambda spec: submitted.append(spec) or spec
-    client._poll = lambda job: {"text": '{"name":"Ada"}'}
-    assert client.chat([{"role": "user", "content": "Name?"}], json_schema=SCHEMA)
+    final = {"job_id": str(uuid4()), "turn_id": None, "state": "succeeded",
+             "result": {"text": '{"name":"Ada"}', "calls": []}}
+    client._submit = lambda spec, **kwargs: submitted.append(spec) or final
+    client._poll = lambda job, **kwargs: final
+    result = client.chat([{"role": "user", "content": "Name?"}], json_schema=SCHEMA)
+    assert result.state == "succeeded" and result.text == '{"name":"Ada"}'
     assert submitted[0]["json_schema"] == SCHEMA
 
 

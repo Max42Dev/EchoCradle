@@ -16,7 +16,6 @@ import sys
 import threading
 import time
 import wave
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -25,6 +24,7 @@ import httpx
 import numpy as np
 
 from config_schema import CONFIG_SCHEMA, missing_fields, validate_config
+from consumer_results import json_value
 from interview import Interview, TurnResult
 from orchestrator.client import ServiceClient
 from orchestrator.hosts.speech import AudioPlayer
@@ -56,7 +56,7 @@ def require(condition: bool, message: str) -> None:
 
 def write_json(path: Path, data: Any) -> None:
     path.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
+        json.dumps(json_value(data), indent=2, ensure_ascii=False, allow_nan=False) + "\n",
         encoding="utf-8",
     )
 
@@ -165,7 +165,7 @@ def interview_smoke(
             "interrupted": interrupted, "repaired": result.repaired,
             "config": result.config, "done": result.done,
             "validation_errors": result.validation_errors,
-            "tool_calls": [asdict(call) for call in result.tool_calls],
+            "tool_calls": json_value(result.tool_calls),
         }
         report["turns"].append(record)
         report["history"] = list(interview.history)
@@ -349,45 +349,44 @@ def cancellation_smoke(client: ServiceClient, report: dict[str, Any]) -> None:
 
     stopped = threading.Event()
     deltas: list[str] = []
-    streamed_jobs: list[str] = []
     first_delta_at: list[float] = []
 
     def on_text(delta: str) -> None:
         if delta and not stopped.is_set():
             deltas.append(delta)
-            with client._lock:
-                streamed_jobs.extend(client._jobs)
             first_delta_at.append(time.monotonic())
             stopped.set()
         # Return immediately so the independent cancellation watcher can work.
 
     started = time.monotonic()
-    text, calls = client.stream_chat_with_tools(
+    result = client.stream_chat_with_tools(
         [{"role": "user", "content": LONG_TEXT}], ToolRegistry(),
-        max_tokens=512, temperature=0, on_text=on_text, should_stop=stopped.is_set,
+        max_tokens=512, temperature=0, on_text=on_text, cancellation=stopped,
     )
     returned = time.monotonic()
     record.update(
-        stream_total_s=returned - started, first_delta=deltas, returned_text=text,
-        tool_calls=[asdict(call) for call in calls],
+        stream_total_s=returned - started, first_delta=deltas, returned_text=result.text,
+        state=result.state, job_id=result.job_id, turn_id=result.turn_id,
+        tool_calls=json_value(result.calls),
     )
     require(bool(first_delta_at), "Cancellation stream produced no text delta")
+    require(result.state == "cancelled", "Streaming result was not cancelled")
     record["after_first_delta_s"] = returned - first_delta_at[0]
     require(record["after_first_delta_s"] < CANCEL_LIMIT_S, "Streaming cancel was not prompt")
-    require(len(streamed_jobs) == 1, "Could not identify the real streamed job")
-    snapshot = trace_job(client, streamed_jobs[0], trace)
+    snapshot = trace_job(client, result.job_id, trace)
     require(snapshot["state"] == "cancelled", "Streaming job was not cancelled")
     while snapshot.get("host_pending"):
         require(time.monotonic() - returned < 120, "Streaming host did not release its lane")
         tick.wait(0.02)
-        snapshot = trace_job(client, streamed_jobs[0], trace)
+        snapshot = trace_job(client, result.job_id, trace)
         require(snapshot["state"] == "cancelled", "Cancelled stream changed state")
     started = time.monotonic()
     following = client.chat(
         [{"role": "user", "content": REPLIES["style"]}], max_tokens=32, temperature=0,
     )
-    record.update(subsequent_text=following, subsequent_job_s=time.monotonic() - started)
-    require(bool(following.strip()), "Text lane did not recover after cancellation")
+    record.update(subsequent_text=following.text, subsequent_job_s=time.monotonic() - started)
+    require(following.state == "succeeded" and bool(following.text.strip()),
+            "Text lane did not recover after cancellation")
     record["host_pending_observed_after_cancel"] = any(
         item["state"] == "cancelled" and item["host_pending"] for item in trace
     )
@@ -423,7 +422,7 @@ def main() -> int:
     started = time.monotonic()
     try:
         before = time.monotonic()
-        with ServiceClient(profile="voice", text_model=args.text_model) as client:
+        with ServiceClient.start_owned(profile="voice", text_model=args.text_model) as client:
             report["service_start_s"] = time.monotonic() - before
             capabilities = client.capabilities()
             report["capabilities"] = capabilities

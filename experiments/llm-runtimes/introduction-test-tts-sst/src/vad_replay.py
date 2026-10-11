@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from main import ModelOrchestrator
+from orchestrator import ModelOrchestrator
 from orchestrator.hosts.speech import read_wav
 
 

@@ -25,8 +25,12 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable, Protocol
+
+from orchestrator.client import ServiceClientError
+from orchestrator.client_types import Message, TextResult, ToolOutcome, ToolRegistry
 
 from config_schema import is_complete, missing_fields, normalize
 from prompts import SPOKEN_RETRY_PROMPT, build_turn_messages
@@ -136,6 +140,22 @@ _FALLBACK_LINES = {
 }
 
 
+class InterviewText(Protocol):
+    """Application text dependency; cancellation is explicit, not a predicate."""
+
+    def chat_with_tools(
+        self, messages: list[Message], registry: ToolRegistry, *,
+        max_tokens: int = 512, temperature: float = 0.7,
+    ) -> TextResult: ...
+
+    def stream_chat_with_tools(
+        self, messages: list[Message], registry: ToolRegistry, *,
+        max_tokens: int = 512, temperature: float = 0.7,
+        on_text: Callable[[str], None] | None = None,
+        cancellation: threading.Event | None = None,
+    ) -> TextResult: ...
+
+
 @dataclass
 class TurnResult:
     """One exchange's outcome."""
@@ -145,7 +165,7 @@ class TurnResult:
     done: bool
     raw: str = ""
     repaired: bool = False
-    tool_calls: list[Any] = field(default_factory=list)
+    tool_calls: list[ToolOutcome] = field(default_factory=list)
     validation_errors: list[str] = field(default_factory=list)
 
 
@@ -153,11 +173,11 @@ class TurnResult:
 class Interview:
     """Drives the conversation until the config is complete."""
 
-    orchestrator: Any
+    orchestrator: InterviewText
     config_tool: Any
     registry: Any
     max_turns: int = 12
-    history: list[dict[str, str]] = field(default_factory=list)
+    history: list[Message] = field(default_factory=list)
     turns: int = 0
     #: Schema problems found after the previous turn, reported to the model.
     validation_errors: list[str] = field(default_factory=list)
@@ -175,11 +195,11 @@ class Interview:
 
     def opening_streaming(
         self,
-        on_sentence: Any,
-        should_stop: Any = None,
+        on_sentence: Callable[[str], None],
+        cancellation: threading.Event | None = None,
     ) -> tuple[TurnResult, bool]:
         """Produce the AI's first line, speaking it as it is generated."""
-        return self._turn_streaming(on_sentence, should_stop)
+        return self._turn_streaming(on_sentence, cancellation)
 
     def respond(self, user_text: str) -> TurnResult:
         """Handle one user utterance and return the AI's reply."""
@@ -189,22 +209,21 @@ class Interview:
     def respond_streaming(
         self,
         user_text: str,
-        on_sentence: Any,
-        should_stop: Any = None,
+        on_sentence: Callable[[str], None],
+        cancellation: threading.Event | None = None,
     ) -> tuple[TurnResult, bool]:
         """Handle one user utterance, speaking the reply as it is generated.
 
         ``on_sentence(sentence)`` is called for each complete sentence the
         moment the model writes it, so speech starts long before the reply is
-        finished. ``should_stop()`` is polled between deltas; when it returns
-        True the model is cut off and only the sentences actually spoken are
+        finished. Setting ``cancellation`` cuts off the model, and only sentences spoken are
         kept in the history — so the model's next turn sees exactly what the
         player heard, not what it had intended to say.
 
         Returns ``(result, interrupted)``.
         """
         self.history.append({"role": "user", "content": user_text})
-        return self._turn_streaming(on_sentence, should_stop)
+        return self._turn_streaming(on_sentence, cancellation)
 
     @property
     def slots(self) -> dict[str, Any]:
@@ -221,7 +240,7 @@ class Interview:
 
     # -- internals ---------------------------------------------------------
 
-    def _prepare_messages(self) -> list[dict[str, str]]:
+    def _prepare_messages(self) -> list[Message]:
         """Track a stall and assemble the message list for one turn."""
         missing_now = self.config_tool.missing()
         if missing_now and missing_now[0] == self._stall_field:
@@ -240,13 +259,13 @@ class Interview:
     def _turn(self) -> TurnResult:
         self.turns += 1
         messages = self._prepare_messages()
-        say, calls, repaired = self._ask(messages)
+        say, calls, repaired, cancelled = self._ask(messages)
 
         # A declined optional field must stay unset, not be stored as the literal
         # word the player used to decline it ("no story" is not a story).
         self._drop_declined_values()
 
-        if not say:
+        if not say and not cancelled:
             say = self._fallback_line()
             repaired = True
 
@@ -267,8 +286,8 @@ class Interview:
 
     def _turn_streaming(
         self,
-        on_sentence: Any,
-        should_stop: Any,
+        on_sentence: Callable[[str], None],
+        cancellation: threading.Event | None,
     ) -> tuple[TurnResult, bool]:
         """One turn whose reply is spoken sentence by sentence as it arrives."""
         from orchestrator.streaming import SentenceSplitter  # noqa: PLC0415
@@ -280,8 +299,10 @@ class Interview:
         aside: list[str] = []
         closers: list[str] = []
 
+        cancellation = cancellation if cancellation is not None else threading.Event()
+
         def emit(sentence: str) -> None:
-            if should_stop is not None and should_stop():
+            if cancellation.is_set():
                 return
             # A sentence that leaks the machinery is never spoken, and never
             # enters the history — the player did not hear it.
@@ -311,17 +332,23 @@ class Interview:
             for sentence in splitter.feed("".join(clean)):
                 emit(sentence)
 
+        result: TextResult | None = None
         try:
-            _text, calls = self.orchestrator.stream_chat_with_tools(
+            result = self.orchestrator.stream_chat_with_tools(
                 messages, self.registry, max_tokens=400, temperature=0.4,
                 on_text=on_text,
-                should_stop=should_stop,
+                cancellation=cancellation,
             )
+        except ServiceClientError as exc:
+            log.warning("text service failed: %s", exc)
+            result = exc.partial_result
         except Exception as exc:  # noqa: BLE001 - surfaced as a fallback line
             log.warning("text host failed: %s", exc)
-            calls = []
 
-        interrupted = bool(should_stop()) if should_stop is not None else False
+        calls = list(result.calls) if result is not None else []
+        interrupted = cancellation.is_set() or (
+            result is not None and result.state == "cancelled"
+        )
         if not interrupted:
             for sentence in splitter.flush():
                 emit(sentence)
@@ -347,6 +374,7 @@ class Interview:
                 say=say,
                 config=dict(self.config_tool.data),
                 done=self.complete,
+                raw=result.text if result is not None else "",
                 repaired=repaired,
                 tool_calls=calls,
                 validation_errors=list(self.validation_errors),
@@ -362,22 +390,33 @@ class Interview:
                 log.info("dropping declined value for %s: %r", name, value)
                 self.config_tool.data.pop(name, None)
 
-    def _ask(self, messages: list[dict[str, str]]) -> tuple[str, list[Any], bool]:
+    def _ask(self, messages: list[Message]) -> tuple[str, list[ToolOutcome], bool, bool]:
         """Native tools remain available on every attempt; the model chooses calls."""
-        calls: list[Any] = []
+        calls: list[ToolOutcome] = []
         for attempt in range(2):
             try:
-                text, requested = self.orchestrator.chat_with_tools(
+                result = self.orchestrator.chat_with_tools(
                     messages, self.registry, max_tokens=400, temperature=0.4,
                 )
-                calls.extend(requested)
-                say = self._spoken_line(text)
+                calls.extend(result.calls)
+                say = self._spoken_line(result.text)
+                if result.state == "cancelled":
+                    return say, calls, False, True
+                if result.state == "failed":
+                    return say, calls, True, False
                 if say:
-                    return say, calls, bool(attempt)
+                    return say, calls, bool(attempt), False
                 messages = messages + [{"role": "system", "content": SPOKEN_RETRY_PROMPT}]
+            except ServiceClientError as exc:
+                log.warning("text service failed: %s", exc)
+                if exc.partial_result is not None:
+                    calls.extend(exc.partial_result.calls)
+                    # Do not repeat uncertain side effects after transport failure.
+                    return (self._spoken_line(exc.partial_result.text), calls, True,
+                            exc.partial_result.state == "cancelled")
             except Exception as exc:  # noqa: BLE001 - bounded retry, then fallback
                 log.warning("text host failed: %s", exc)
-        return "", calls, True
+        return "", calls, True, False
 
     @classmethod
     def _spoken_line(cls, raw: str) -> str:

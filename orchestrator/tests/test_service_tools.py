@@ -17,8 +17,7 @@ DECLARATION = ToolSpec("lookup_weather", "Look up local weather for a town.", {
 
 
 def test_session_accepts_custom_tool_description() -> None:
-    declarations, mode = session_spec({"tools": [DECLARATION]})
-    assert declarations == [DECLARATION] and mode == "text"
+    assert session_spec({"tools": [DECLARATION]}) == [DECLARATION]
 
 
 @pytest.mark.parametrize("tools", [
@@ -33,7 +32,7 @@ def test_invalid_declarations_rejected(tools: list) -> None:
 
 def test_remote_registry_passes_full_description_and_rejects_bad_args() -> None:
     identifier = str(uuid4())
-    runtime = SimpleNamespace(sessions={identifier: _Session(identifier, [DECLARATION], "text")})
+    runtime = SimpleNamespace(sessions={identifier: _Session(identifier, [DECLARATION])})
     job = SimpleNamespace(spec=SimpleNamespace(session_id=identifier), should_stop=lambda: False)
     registry = _RemoteRegistry(runtime, job)
     assert registry.specs() == [DECLARATION]

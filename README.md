@@ -39,6 +39,15 @@ Hub and follow **[Unity/README.md](Unity/README.md)**. It uses the local model
 orchestrator, supports microphone interruptions and saves validated JSON before
 exiting. Load game is not implemented yet.
 
+The shipped text/voice path uses llama.cpp and sherpa-onnx behind the cached-only
+local service, not the vision table's Ollama authoring stack. See
+[orchestrator API](orchestrator/README.md) and
+[exact service usage](docs/SERVICE_USAGE.md). Python applications explicitly use
+`orchestrator.client.ServiceClient.start_owned(...)` or `attach(...)` on a worker;
+its synchronous API returns typed text/tool outcomes. The Unity transport is
+implemented and offline-tested. Image/3D/music/SFX serving, automatic provisioning
+and joint resource scheduling remain proposals, not shipped service features.
+
 ## Skills
 
 Agent skills live in `.github/skills/` and load on demand:

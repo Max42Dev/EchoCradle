@@ -18,6 +18,7 @@ if str(_SRC) not in sys.path:
 import prompts  # noqa: E402
 from config_schema import CONFIG_SCHEMA  # noqa: E402
 from interview import Interview  # noqa: E402
+from local_interview import LocalInterviewText  # noqa: E402
 from orchestrator import JsonConfigTool, ModelOrchestrator, Modality, ToolRegistry  # noqa: E402
 
 PLAYER = {
@@ -66,7 +67,7 @@ def _run(mo, trials: int) -> dict[str, tuple[int, int]]:
             tool = JsonConfigTool(CONFIG_SCHEMA, name="config")
             registry = ToolRegistry()
             tool.register_into(registry)
-            interview = Interview(mo, tool, registry, max_turns=16)
+            interview = Interview(LocalInterviewText(mo), tool, registry, max_turns=16)
             attempts: dict[str, int] = {}
             turn = interview.opening()
             for _ in range(16):

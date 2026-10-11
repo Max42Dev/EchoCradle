@@ -39,7 +39,7 @@ from orchestrator.runtimes import RuntimeCatalog
 from orchestrator.service_protocol import (
     ARTIFACT_LIMIT, JSON_LIMIT, PCM_LIMIT,
     PROTOCOL_VERSION, TERMINAL, TOOL_LIMIT, TTL_SECONDS, JobSpec, ServiceError,
-    decode, encode, envelope, fields, session_spec, string, uuid_string,
+    decode, decode_value, encode, envelope, fields, session_spec, string, uuid_string,
 )
 from orchestrator.store import InstalledModel, ModelStore, ProgressFn
 
@@ -279,7 +279,6 @@ class _Job:
 class _Session:
     id: str
     tools: list[dict[str, Any]]
-    delivery_mode: str
     connection: _Connection | None = None
     disconnected_at: float = field(default_factory=time.monotonic)
 
@@ -292,6 +291,7 @@ class _Session:
 class _PendingTool:
     job: _Job
     future: asyncio.Future[Any]
+    record: dict[str, Any]
 
 
 class _Connection:
@@ -307,11 +307,23 @@ class _Connection:
         self.closed = False
         self.accepted = False
         self.pending: dict[str, _PendingTool] = {}
+        self.cleanup_started = False
+
+    def envelope(
+        self, event: str, payload: dict[str, Any], job: _Job | None, seq: int,
+    ) -> dict[str, Any]:
+        return {
+            "v": PROTOCOL_VERSION, "seq": seq, "type": event,
+            "service_instance_id": self.runtime.instance_id,
+            "session_id": self.session.id, "job_id": job.id if job else None,
+            "turn_id": job.spec.turn_id if job else None, "payload": payload,
+        }
 
     async def emit(self, event: str, payload: dict[str, Any], job: _Job | None = None) -> None:
         if self.closed or not self.accepted:
             raise ServiceError("SOCKET_LOST", "The session socket is unavailable.", 409)
-        size = len(encode(payload)) + 512
+        # Reserve the largest legal sequence, not an estimated envelope overhead.
+        size = len(encode(self.envelope(event, payload, job, 2**64 - 1)))
         deadline = self.runtime.loop.time() + 5
         while self.queued_bytes + size > 256 * 1024 or self.queue.full():
             if self.closed or self.runtime.loop.time() >= deadline:
@@ -331,13 +343,7 @@ class _Connection:
                     if (job is not None and job.should_stop()
                             and event not in ("job.state", "error")):
                         continue
-                    data = {
-                        "v": PROTOCOL_VERSION, "seq": self.next_seq, "type": event,
-                        "service_instance_id": self.runtime.instance_id,
-                        "session_id": self.session.id,
-                        "job_id": job.id if job else None,
-                        "turn_id": job.spec.turn_id if job else None, "payload": payload,
-                    }
+                    data = self.envelope(event, payload, job, self.next_seq)
                     self.next_seq += 1
                     await asyncio.wait_for(self.websocket.send_text(encode(data).decode()), 5)
                 finally:
@@ -345,10 +351,7 @@ class _Connection:
         finally:
             self.closed = True
             self.runtime.disconnect(self.session, self)
-            try:
-                await self.websocket.close(code=1008)
-            except Exception:
-                pass
+            self.runtime.close_connection(self, code=1008)
 
 
 class _RemoteRegistry:
@@ -362,17 +365,29 @@ class _RemoteRegistry:
         } if session else {}
         self.names = tuple(self.declarations)
         self.count = 0
+        self.calls: list[dict[str, Any]] = []
 
     def specs(self) -> list[dict[str, Any]]:
         return json.loads(encode(list(self.declarations.values())))
 
+    def results_delivered(self, calls: list[Any]) -> None:
+        """The host observed a response to a continuation containing these results."""
+        for call, record in zip(calls, self.calls):
+            record.update(id=call.id, result_delivered=True)
+
     def invoke(self, name: str, arguments: dict[str, Any]) -> Any:
         from jsonschema import ValidationError, validate
 
+        record = {
+            "id": None, "name": name, "arguments": arguments, "result": None,
+            "dispatch_id": None, "outcome": "rejected", "result_delivered": False,
+        }
+        self.calls.append(record)
         if self.job.should_stop():
             raise ServiceError("CANCELLED", "Job was cancelled.", 409)
         if not isinstance(name, str) or name not in self.names:
-            return {"ok": False, "error": "TOOL_NOT_PERMITTED"}
+            record["result"] = {"ok": False, "error": "TOOL_NOT_PERMITTED"}
+            return record["result"]
         self.count += 1
         if self.count > 8:
             raise ServiceError("TOOL_LIMIT", "At most eight tool calls are permitted.")
@@ -380,9 +395,10 @@ class _RemoteRegistry:
             encode(arguments, TOOL_LIMIT)
             validate(arguments, self.declarations[name]["function"]["parameters"])
         except (ValidationError, ServiceError):
-            return {"ok": False, "error": "INVALID_TOOL_ARGUMENTS"}
+            record["result"] = {"ok": False, "error": "INVALID_TOOL_ARGUMENTS"}
+            return record["result"]
         future = asyncio.run_coroutine_threadsafe(
-            self.runtime.remote_tool(self.job, name, arguments), self.runtime.loop,
+            self.runtime.remote_tool(self.job, name, arguments, record), self.runtime.loop,
         )
         try:
             # The coroutine imposes a 5s remote result deadline; allow emission's
@@ -420,6 +436,50 @@ class _Runtime:
         self.workers: list[asyncio.Task[Any]] = []
         self.startup_task: asyncio.Task[Any] | None = None
         self.housekeeping: asyncio.Task[Any] | None = None
+        self.socket_cleanup: set[asyncio.Task[Any]] = set()
+        self.ownership_cleanup: asyncio.Task[Any] | None = None
+        self.shutdown_task: asyncio.Task[Any] | None = None
+        self.drain_task: asyncio.Task[Any] | None = None
+        self.native_pending: set[asyncio.Future[Any]] = set()
+
+    def native_call(self, lane: str, function: Callable[..., Any], *args: Any) -> Any:
+        future = self.loop.run_in_executor(self.executors[lane], function, *args)
+        self.native_pending.add(future)
+        future.add_done_callback(self.native_pending.discard)
+        return future
+
+    def close_connection(self, connection: _Connection, *, code: int = 1008) -> None:
+        """Detach immediately; a stalled transport never holds a lane or reaper."""
+        self.disconnect(connection.session, connection)
+        if connection.cleanup_started:
+            return
+        connection.cleanup_started = True
+
+        async def close() -> None:
+            try:
+                await connection.websocket.close(code=code)
+            except Exception:
+                pass
+
+        task = asyncio.create_task(close())
+        self.socket_cleanup.add(task)
+        task.add_done_callback(self.socket_cleanup.discard)
+        # Do not await cancellation acknowledgement from a broken transport.
+        timer = self.loop.call_later(1, task.cancel)
+        task.add_done_callback(lambda _: timer.cancel())
+
+    async def release_ownership(self) -> None:
+        """Run only after loading/inference has returned; keep the lock on unload failure."""
+        if self.ownership_cleanup is None:
+            async def release() -> None:
+                if self.facade is not None:
+                    await self.loop.run_in_executor(self.executors["text"], self.facade.stop)
+                    self.facade = None
+                if self.store_lock:
+                    self.store_lock.release()
+
+            self.ownership_cleanup = asyncio.create_task(release())
+        await asyncio.shield(self.ownership_cleanup)
 
     async def start(self) -> None:
         self.loop = asyncio.get_running_loop()
@@ -490,10 +550,9 @@ class _Runtime:
         self.diagnostics = diagnostics
 
     async def load_profile(self) -> None:
+        native = self.native_call("text", self._load_profile)
         try:
-            diagnostics = await self.loop.run_in_executor(
-                self.executors["text"], self._load_profile,
-            )
+            diagnostics = await asyncio.shield(native)
             self.diagnostics = diagnostics
             if self.state == "starting":
                 self.state = "ready"
@@ -504,11 +563,28 @@ class _Runtime:
             if self.state == "starting":
                 self.state = "failed"
             log.error("Service startup failed: %s", error.code)
+            try:
+                await self.release_ownership()
+            except Exception:
+                log.error("Startup rollback failed; store ownership retained")
+        except asyncio.CancelledError:
+            # The Python task is cancellable, the native loader is not. Keep an
+            # accounted continuation rather than unloading underneath it.
+            async def rollback() -> None:
+                try:
+                    await native
+                except Exception:
+                    pass
+                await self.release_ownership()
+
+            self.state = "draining"
+            self.startup_task = asyncio.create_task(rollback())
+            raise
 
     def capabilities(self) -> dict[str, Any]:
         kinds: dict[str, Any] = {}
-        for kind in ("text", "dialogue", "tts", "stt"):
-            lane = "text" if kind == "dialogue" else kind
+        for kind in ("text", "tts", "stt"):
+            lane = kind
             supported = lane == "text" or self.config.profile == "voice"
             status = "unsupported" if not supported else (
                 "ready" if self.state == "ready" else
@@ -553,6 +629,31 @@ class _Runtime:
             raise ServiceError("JOB_NOT_FOUND", "Unknown or expired job.", 404)
         return job
 
+    def job_snapshot(self, job: _Job, **changes: Any) -> dict[str, Any]:
+        """Canonical bounded representation for all REST and state events."""
+        snapshot = {
+            "v": PROTOCOL_VERSION, "protocol_version": PROTOCOL_VERSION,
+            "service_instance_id": self.instance_id, **job.snapshot(),
+            "selected_model": self.diagnostics["actual"].get(job.spec.kind),
+        }
+        snapshot.update(changes)
+        encode(snapshot)
+        return snapshot
+
+    def validate_success(self, job: _Job, result: Any) -> None:
+        snapshot = self.job_snapshot(
+            job, result=result, state="succeeded", host_pending=False,
+            revision=job.revision + 2,
+        )
+        # State event budgets apply even without a currently attached socket.
+        session = self.sessions.get(job.spec.session_id or "")
+        if session:
+            connection = _Connection(self, session, None)
+            encode(connection.envelope("job.state", snapshot, job, 2**64 - 1))
+            if job.spec.streaming:
+                encode(connection.envelope("text.end", {"text": result["text"]},
+                                           job, 2**64 - 1))
+
     def prune(self) -> None:
         now = time.monotonic()
         for identifier, artifact in list(self.artifacts.items()):
@@ -592,10 +693,12 @@ class _Runtime:
                         "IDEMPOTENCY_CONFLICT", "Key was used for another request.", 409,
                     )
                 return prior
-        lane = "text" if spec.kind in ("text", "dialogue") else spec.kind
+        lane = spec.kind
         if lane != "text" and self.config.profile != "voice":
             raise ServiceError("UNSUPPORTED_KIND", "Voice profile is not configured.")
         session = self.get_session(spec.session_id) if spec.session_id else None
+        if spec.json_schema is not None and session and session.tools:
+            raise ServiceError("INVALID_SPEC", "Tools and response schemas cannot be combined.")
         if spec.turn_id and session is None:
             raise ServiceError("INVALID_SPEC", "Turn IDs require a session.")
         connection = session.connection if session else None
@@ -635,7 +738,7 @@ class _Runtime:
         # submit/cancel cycles could exhaust the bounded lane queue despite the
         # active admission count dropping to zero.
         if not job.host_pending:
-            lane = "text" if job.spec.kind in ("text", "dialogue") else job.spec.kind
+            lane = job.spec.kind
             queue = self.queues[lane]
             retained = []
             while not queue.empty():
@@ -681,14 +784,12 @@ class _Runtime:
         if connection and not connection.closed and connection.accepted:
             try:
                 await connection.emit(event, payload, job)
-            except ServiceError:
-                self.disconnect(session, connection)
-                try:
-                    await connection.websocket.close(code=1008)
-                except Exception:
-                    pass
+            except Exception:
+                self.close_connection(connection)
 
-    async def remote_tool(self, job: _Job, name: str, arguments: dict[str, Any]) -> Any:
+    async def remote_tool(
+        self, job: _Job, name: str, arguments: dict[str, Any], record: dict[str, Any],
+    ) -> Any:
         if job.should_stop():
             raise ServiceError("CANCELLED", "Tool outcome is unknown.", 409)
         session = self.get_session(job.spec.session_id or "")
@@ -698,18 +799,26 @@ class _Runtime:
         if connection.pending:
             raise ServiceError("RESOURCE_BUSY", "One pending tool per session.", 409)
         identifier = str(uuid4())
+        record["dispatch_id"] = identifier
+        # Allocation/emission failures already make dispatch uncertain; never
+        # expose a server-rejected record carrying a dispatch UUID.
+        record["outcome"] = "unknown"
         future = self.loop.create_future()
-        connection.pending[identifier] = _PendingTool(job, future)
+        connection.pending[identifier] = _PendingTool(job, future, record)
         job.state = "waiting_tool"
         job.revision += 1
         try:
-            await connection.emit("job.state", job.snapshot(), job)
+            await connection.emit("job.state", self.job_snapshot(job), job)
+            # Enqueueing is not proof of execution. Any dispatched attempt stays
+            # unknown until an authenticated client result is received.
             await connection.emit("tool.call", {
                 "call_id": identifier, "name": name, "arguments": arguments, "timeout_ms": 5000,
             }, job)
             result = await asyncio.wait_for(
                 future, min(5, max(0.001, job.deadline - time.monotonic())),
             )
+            record["outcome"] = "completed"
+            record["result"] = result
             if job.should_stop():
                 raise ServiceError("CANCELLED", "Tool outcome is unknown.", 409)
             return result
@@ -752,7 +861,7 @@ class _Runtime:
         if job.should_stop():
             return None
         spec = job.spec
-        if spec.kind in ("text", "dialogue"):
+        if spec.kind == "text":
             registry = _RemoteRegistry(self, job)
             messages = list(spec.messages)
             if spec.text:
@@ -784,7 +893,7 @@ class _Runtime:
                 if job.should_stop():
                     return None
                 text = "".join(parts)
-                data = decode(text, 24 * 1024)
+                data = decode_value(text, 24 * 1024)
                 if not Draft202012Validator(spec.json_schema).is_valid(data):
                     raise ServiceError("INVALID_OUTPUT", "Model response failed its schema.")
                 return {"text": text, "calls": []}
@@ -798,16 +907,31 @@ class _Runtime:
                 if spec.streaming:
                     self._emit_from_worker(job, chunk)
 
-            text, calls = self.facade.text.stream_chat_with_tools(
-                messages, registry, max_tokens=spec.max_tokens,
-                temperature=spec.temperature, max_rounds=4,
-                on_text=on_text, should_stop=job.should_stop,
-            )
-            result = {"text": text, "calls": [
-                {"id": call.id, "name": call.name, "arguments": call.arguments,
-                 "result": call.result} for call in calls
-            ]}
+            try:
+                text, calls = self.facade.text.stream_chat_with_tools(
+                    messages, registry, max_tokens=spec.max_tokens,
+                    temperature=spec.temperature, max_rounds=4,
+                    on_text=on_text, should_stop=job.should_stop,
+                )
+            except Exception:
+                # Preserve side-effect uncertainty even when the host aborts.
+                partial = {"text": "", "calls": registry.calls}
+                try:
+                    self.validate_success(job, partial)
+                except ServiceError:
+                    pass
+                else:
+                    job.result = partial
+                raise
+            # The real host invokes synchronously and returns calls in invocation
+            # order. Model IDs are only available after invoke returns; never
+            # invent a model_call_id on the socket.
+            for call, record in zip(calls, registry.calls, strict=True):
+                record.update(id=call.id, result=call.result)
+            result = {"text": text, "calls": registry.calls}
             encode(result, JSON_LIMIT - 2048)
+            self.validate_success(job, result)
+            job.result = result
             return result
         import numpy as np
 
@@ -851,13 +975,32 @@ class _Runtime:
                 job.host_pending = True
                 job.state = "running"
                 job.revision += 1
-                await self.notify(job, "job.state", job.snapshot())
+                native: asyncio.Future[Any] | None = None
                 try:
-                    result = await self.loop.run_in_executor(self.executors[name], self.infer, job)
+                    await self.notify(job, "job.state", self.job_snapshot(job))
+                    native = self.native_call(name, self.infer, job)
+                    try:
+                        result = await asyncio.shield(native)
+                    except asyncio.CancelledError:
+                        self.cancel_job(job)
+                        # Keep host_pending honest until native code actually exits.
+                        try:
+                            await asyncio.shield(native)
+                        except Exception:
+                            pass
+                        raise
                     if job.should_stop():
                         self.cancel_job(job, deadline=not job.cancel.is_set())
                     elif job.state not in TERMINAL:
-                        job.result = self.publish(*result) if name == "tts" else result
+                        published = self.publish(*result) if name == "tts" else result
+                        try:
+                            self.validate_success(job, published)
+                        except ServiceError:
+                            if name == "tts":
+                                artifact = self.artifacts.pop(published["artifact_id"])
+                                self.artifact_bytes -= len(artifact.pcm)
+                            raise ServiceError("OUTPUT_LIMIT", "Result exceeds its wire budget.")
+                        job.result = published
                         job.state = "succeeded"
                         job.completed = time.monotonic()
                         job.revision += 1
@@ -868,16 +1011,33 @@ class _Runtime:
                         error = (exc if isinstance(exc, ServiceError) else
                                  ServiceError("HOST_FAILED", "Local inference failed.", 500))
                         job.state = "failed"
+                        # Do not let an invalid partial result poison every GET.
+                        try:
+                            self.job_snapshot(job)
+                        except ServiceError:
+                            job.result = None
                         job.error = error.body(job.id)["error"]
                         job.completed = time.monotonic()
                         job.revision += 1
                         await self.notify(job, "error", {"error": job.error})
                 finally:
                     # Never free the lane because an HTTP request was cancelled.
-                    job.host_pending = False
-                    job.input_pcm = None
+                    if native is not None and not native.done():
+                        # Repeated task cancellation can interrupt even the
+                        # shielded drain. Native completion still owns its input.
+                        def returned(future: asyncio.Future[Any], job: _Job = job) -> None:
+                            if not future.cancelled():
+                                future.exception()
+                            job.host_pending = False
+                            job.input_pcm = None
+                            job.revision += 1
+
+                        native.add_done_callback(returned)
+                    else:
+                        job.host_pending = False
+                        job.input_pcm = None
                     job.revision += 1
-                    await self.notify(job, "job.state", job.snapshot())
+                    await self.notify(job, "job.state", self.job_snapshot(job))
             finally:
                 if job is not None and not job.host_pending:
                     job.input_pcm = None
@@ -890,7 +1050,7 @@ class _Runtime:
             for job in list(self.jobs.values()):
                 if job.state not in TERMINAL and time.monotonic() >= job.deadline:
                     self.cancel_job(job, deadline=True)
-                    await self.notify(job, "job.state", job.snapshot())
+                    await self.notify(job, "job.state", self.job_snapshot(job))
             for identifier, session in list(self.sessions.items()):
                 if session.connection is None and time.monotonic() - session.disconnected_at >= 60:
                     for job in self.jobs.values():
@@ -906,42 +1066,47 @@ class _Runtime:
             self.cancel_job(job)
 
     async def stop(self) -> None:
+        if self.shutdown_task is None:
+            self.shutdown_task = asyncio.create_task(self._stop())
+        await asyncio.shield(self.shutdown_task)
+
+    async def _stop(self) -> None:
         self.begin_shutdown()
         if self.housekeeping:
             self.housekeeping.cancel()
+            await asyncio.gather(self.housekeeping, return_exceptions=True)
         for session in list(self.sessions.values()):
             connection = session.connection
             if connection:
-                self.disconnect(session, connection)
-                try:
-                    await asyncio.wait_for(connection.websocket.close(code=1001), 1)
-                except Exception:
-                    pass
+                self.close_connection(connection, code=1001)
         for queue in self.queues.values():
             queue.put_nowait(None)
         pending = [*self.workers]
         if self.startup_task:
             pending.append(self.startup_task)
-        _, remaining = await asyncio.wait(pending, timeout=5)
-        if not remaining:
-            if self.facade is not None:
-                cleanup = self.loop.run_in_executor(self.executors["text"], self.facade.stop)
-                try:
-                    await asyncio.wait_for(asyncio.shield(cleanup), 5)
-                except asyncio.TimeoutError:
-                    log.warning("Host unload remains pending; owner termination may be required")
-                    for executor in self.executors.values():
-                        executor.shutdown(wait=False, cancel_futures=False)
-                    return
-            if self.store_lock:
-                self.store_lock.release()
-            self.state = "stopped"
-        else:
-            # Leave the writer lock and models intact while native work is alive.
-            # The spawned owner must force-terminate its owned process if needed.
+        async def drain() -> None:
+            await asyncio.gather(*pending, return_exceptions=True)
+            # A task cancellation is not proof that native loading/inference ended.
+            if self.native_pending:
+                await asyncio.gather(*self.native_pending, return_exceptions=True)
+            if self.startup_task and self.startup_task not in pending:
+                await asyncio.gather(self.startup_task, return_exceptions=True)
+            try:
+                await self.release_ownership()
+            except Exception:
+                log.warning("Host unload incomplete; store ownership retained")
+            else:
+                self.state = "stopped"
+            finally:
+                for executor in self.executors.values():
+                    executor.shutdown(wait=False, cancel_futures=False)
+
+        self.drain_task = asyncio.create_task(drain())
+        try:
+            await asyncio.wait_for(asyncio.shield(self.drain_task), 5)
+        except asyncio.TimeoutError:
+            # Completion remains accounted for and will unload only after return.
             log.warning("Native work remains pending; owner termination may be required")
-        for executor in self.executors.values():
-            executor.shutdown(wait=False, cancel_futures=False)
 
 
 def create_app(
@@ -952,6 +1117,8 @@ def create_app(
     """Build a FastAPI app. Hosts load only during its lifespan, in a worker."""
     from fastapi import FastAPI, Request, WebSocket
     from fastapi.responses import JSONResponse, Response
+    from fastapi.exceptions import RequestValidationError
+    from starlette.exceptions import HTTPException
     # FastAPI resolves postponed endpoint annotations in the module namespace.
     globals().update(Request=Request, WebSocket=WebSocket)
     config = config or ServiceConfig()
@@ -976,6 +1143,22 @@ def create_app(
     async def service_error(request: Request, exc: ServiceError) -> Any:
         return JSONResponse(exc.body(), status_code=exc.status)
 
+    @app.exception_handler(HTTPException)
+    async def http_error(request: Request, exc: HTTPException) -> Any:
+        code = {404: "NOT_FOUND", 405: "METHOD_NOT_ALLOWED"}.get(exc.status_code, "HTTP_ERROR")
+        error = ServiceError(code, "HTTP request could not be served.", exc.status_code)
+        return JSONResponse(error.body(), status_code=error.status, headers=exc.headers)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError) -> Any:
+        error = ServiceError("INVALID_SPEC", "Invalid request parameters.")
+        return JSONResponse(error.body(), status_code=error.status)
+
+    @app.exception_handler(Exception)
+    async def unexpected_error(request: Request, exc: Exception) -> Any:
+        error = ServiceError("INTERNAL_ERROR", "The service could not complete the request.", 500)
+        return JSONResponse(error.body(), status_code=error.status)
+
     async def body(request: Request) -> dict[str, Any]:
         if request.headers.get("content-type", "").split(";")[0].strip() != "application/json":
             raise ServiceError("INVALID_CONTENT_TYPE", "Expected application/json.", 415)
@@ -999,14 +1182,14 @@ def create_app(
     async def create_session(request: Request) -> dict[str, Any]:
         if runtime.state in ("draining", "stopped"):
             raise ServiceError("NOT_READY", "The service is draining.", 503)
-        tools, mode = session_spec(await body(request))
+        tools = session_spec(await body(request))
         if len(runtime.sessions) >= 4:
             raise ServiceError("RESOURCE_BUSY", "Session quota exhausted.", 429)
         identifier = str(uuid4())
-        runtime.sessions[identifier] = _Session(identifier, tools, mode)
+        runtime.sessions[identifier] = _Session(identifier, tools)
         return {**await live(), "session_id": identifier,
             "permitted_tools": runtime.sessions[identifier].permitted_tools,
-                "delivery_mode": mode, "events_path": f"/v1/sessions/{identifier}/events"}
+                "events_path": f"/v1/sessions/{identifier}/events"}
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> dict[str, Any]:
@@ -1016,30 +1199,28 @@ def create_app(
                 runtime.cancel_job(job)
         connection = session.connection
         if connection:
-            runtime.disconnect(session, connection)
-            await connection.websocket.close(code=1001)
+            runtime.close_connection(connection, code=1001)
         runtime.sessions.pop(session.id, None)
         return {"session_id": session.id, "state": "expired"}
 
     @app.post("/v1/jobs", status_code=202)
     async def submit_job(request: Request) -> dict[str, Any]:
         job = runtime.submit(JobSpec.parse(await body(request)))
-        return {**await live(), **job.snapshot()}
+        return runtime.job_snapshot(job)
 
     @app.get("/v1/jobs/{job_id}")
     async def get_job(job_id: str) -> dict[str, Any]:
         runtime.prune()
         job = runtime.get_job(job_id)
-        lane = "text" if job.spec.kind == "dialogue" else job.spec.kind
-        return {**await live(), **job.snapshot(),
-                "selected_model": runtime.diagnostics["actual"].get(lane)}
+        return runtime.job_snapshot(job)
 
     @app.post("/v1/jobs/{job_id}/cancel")
     async def cancel_job(job_id: str) -> dict[str, Any]:
         job = runtime.get_job(job_id)
         runtime.cancel_job(job)
-        await runtime.notify(job, "job.state", job.snapshot())
-        return job.snapshot()
+        snapshot = runtime.job_snapshot(job)
+        await runtime.notify(job, "job.state", snapshot)
+        return runtime.job_snapshot(job)
 
     @app.post("/v1/artifacts", status_code=201)
     async def upload_artifact(request: Request) -> dict[str, Any]:
@@ -1137,7 +1318,7 @@ def create_app(
                     if job.spec.session_id != session.id:
                         raise ServiceError("FORBIDDEN", "Job belongs to another session.", 403)
                     runtime.cancel_job(job)
-                    await connection.emit("job.state", job.snapshot(), job)
+                    await connection.emit("job.state", runtime.job_snapshot(job), job)
                 elif event == "tool.result":
                     fields(payload, {"call_id", "result"}, {"call_id", "result"})
                     encode(payload["result"], TOOL_LIMIT)
@@ -1154,6 +1335,7 @@ def create_app(
                             != pending.job.spec.turn_id):
                         raise ServiceError("PROTOCOL_ERROR", "Tool result identity mismatch.", 400)
                     pending.future.set_result(payload["result"])
+                    pending.record.update(outcome="completed", result=payload["result"])
                 else:
                     raise ServiceError("PROTOCOL_ERROR", "Unsupported socket event.", 400)
         except (WebSocketDisconnect, asyncio.TimeoutError):
@@ -1165,21 +1347,17 @@ def create_app(
                     await asyncio.wait_for(connection.queue.join(), 0.2)
                 except (ServiceError, asyncio.TimeoutError):
                     pass
-            try:
-                await websocket.close(code=1009 if exc.status == 413 else
-                                      1002 if exc.status in (400, 422) else 1008)
-            except Exception:
-                pass
+            if connection:
+                runtime.close_connection(connection, code=1009 if exc.status == 413 else
+                                         1002 if exc.status in (400, 422) else 1008)
         finally:
             if connection:
-                runtime.disconnect(connection.session, connection)
+                runtime.close_connection(connection, code=1001)
             if writer:
                 writer.cancel()
-                await asyncio.gather(writer, return_exceptions=True)
-            try:
-                await websocket.close(code=1001)
-            except Exception:
-                pass
+                # Writer cleanup is detached as well as transport close.
+                runtime.socket_cleanup.add(writer)
+                writer.add_done_callback(runtime.socket_cleanup.discard)
 
     return app
 

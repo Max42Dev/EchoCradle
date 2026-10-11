@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -22,6 +24,7 @@ if str(_SRC) not in sys.path:
 from config_schema import CONFIG_SCHEMA  # noqa: E402
 from interview import Interview  # noqa: E402
 from orchestrator import JsonConfigTool, ToolRegistry  # noqa: E402
+from orchestrator.client_types import TextResult, ToolOutcome  # noqa: E402
 
 
 class FakeOrchestrator:
@@ -37,45 +40,47 @@ class FakeOrchestrator:
         self.calls.append(messages)
         calls = []
         if self.tool_calls:
-            from orchestrator.tools import ToolCall
-
             for name, arguments in self.tool_calls.pop(0):
                 result = registry.invoke(name, arguments)
-                calls.append(ToolCall(id="", name=name, arguments=arguments, result=result))
+                calls.append(ToolOutcome("call", str(uuid4()), name, arguments, result,
+                                         "completed", True, True))
         reply = self.replies.pop(0) if self.replies else json.dumps({"say": "Hm."})
-        return reply, calls
+        return TextResult("succeeded", reply, str(uuid4()), str(uuid4()), tuple(calls))
 
-    def chat(self, messages, **kwargs) -> str:
+    def chat(self, messages, **kwargs) -> TextResult:
         self.calls.append(messages)
-        return self.replies.pop(0) if self.replies else ""
+        return TextResult("succeeded", self.replies.pop(0) if self.replies else "",
+                          str(uuid4()), None)
 
     def stream_chat_with_tools(
-        self, messages, registry, *, on_text=None, should_stop=None, **kwargs
+        self, messages, registry, *, on_text=None, cancellation=None, **kwargs
     ):
         """Emit the queued reply as deltas, honouring an interruption.
 
-        Mirrors the real host: text arrives in chunks, ``on_text`` sees each
-        one, and ``should_stop`` is polled between chunks so a barge-in cuts
+        Mirrors the service: text arrives in chunks, ``on_text`` sees each
+        one, and ``cancellation`` is checked between chunks so a barge-in cuts
         generation short.
         """
         self.calls.append(messages)
         calls = []
-        if should_stop is not None and should_stop():
-            return "", calls
+        if cancellation is not None and cancellation.is_set():
+            return TextResult("cancelled", "", str(uuid4()), str(uuid4()))
         if self.tool_calls:
-            from orchestrator.tools import ToolCall
-
             for name, arguments in self.tool_calls.pop(0):
                 result = registry.invoke(name, arguments)
-                calls.append(ToolCall(id="", name=name, arguments=arguments, result=result))
+                calls.append(ToolOutcome("call", str(uuid4()), name, arguments, result,
+                                         "completed", True, True))
         reply = self.replies.pop(0) if self.replies else ""
+        chunks = []
         # Feed a few characters at a time so sentence boundaries appear mid-stream.
         for i in range(0, len(reply), 4):
-            if should_stop is not None and should_stop():
+            if cancellation is not None and cancellation.is_set():
                 break
+            chunks.append(reply[i : i + 4])
             if on_text is not None:
                 on_text(reply[i : i + 4])
-        return reply, calls
+        state = "cancelled" if cancellation is not None and cancellation.is_set() else "succeeded"
+        return TextResult(state, "".join(chunks), str(uuid4()), str(uuid4()), tuple(calls))
 
 
 def _say(text: str) -> str:
@@ -107,8 +112,10 @@ def test_cancelled_turn_never_executes_tools():
     interview, tool, _ = _make([], tool_calls=[[
         ("config_set", {"field": "username", "value": "Ada"}),
     ]])
+    cancellation = threading.Event()
+    cancellation.set()
     turn, interrupted = interview.respond_streaming("I'm Ada.", lambda text: None,
-                                                   should_stop=lambda: True)
+                                                   cancellation=cancellation)
     assert interrupted and not turn.tool_calls and not tool.data
 
 
@@ -359,10 +366,13 @@ def test_interruption_truncates_the_history_to_what_was_spoken():
     interview, _, _ = _make(["First sentence. Second sentence. Third sentence."])
     spoken: list[str] = []
 
-    def should_stop() -> bool:
-        return len(spoken) >= 1
+    cancellation = threading.Event()
 
-    turn, interrupted = interview.opening_streaming(spoken.append, should_stop)
+    def speak(sentence: str) -> None:
+        spoken.append(sentence)
+        cancellation.set()
+
+    turn, interrupted = interview.opening_streaming(speak, cancellation)
 
     assert interrupted
     assert spoken == ["First sentence."]
@@ -375,10 +385,13 @@ def test_interrupted_turn_keeps_the_user_message_for_the_next_turn():
     interview, _, _ = _make([full, "Understood."])
     spoken: list[str] = []
 
-    def should_stop() -> bool:
-        return len(spoken) >= 1
+    cancellation = threading.Event()
 
-    interview.respond_streaming("my name is Max", spoken.append, should_stop)
+    def speak(sentence: str) -> None:
+        spoken.append(sentence)
+        cancellation.set()
+
+    interview.respond_streaming("my name is Max", speak, cancellation)
     # The player's words are in the history, followed by the truncated reply.
     assert interview.history[-2] == {"role": "user", "content": "my name is Max"}
     assert interview.history[-1]["content"] == "First sentence here."
@@ -388,7 +401,9 @@ def test_interrupted_turn_keeps_the_user_message_for_the_next_turn():
 def test_cancelled_before_first_sentence_does_not_emit_fallback():
     interview, _, _ = _make(["A sentence that must never be spoken."])
     emitted: list[str] = []
-    turn, interrupted = interview.opening_streaming(emitted.append, lambda: True)
+    cancellation = threading.Event()
+    cancellation.set()
+    turn, interrupted = interview.opening_streaming(emitted.append, cancellation)
     assert interrupted
     assert turn.say == ""
     assert not emitted
@@ -397,9 +412,13 @@ def test_cancelled_before_first_sentence_does_not_emit_fallback():
 def test_cancelled_fragment_is_not_flushed_to_speech():
     interview, _, _ = _make(["First sentence. An unfinished continuation"])
     emitted: list[str] = []
-    turn, interrupted = interview.opening_streaming(
-        emitted.append, lambda: bool(emitted)
-    )
+    cancellation = threading.Event()
+
+    def speak(sentence: str) -> None:
+        emitted.append(sentence)
+        cancellation.set()
+
+    turn, interrupted = interview.opening_streaming(speak, cancellation)
     assert interrupted
     assert emitted == ["First sentence."]
     assert turn.say == "First sentence."

@@ -40,9 +40,14 @@ public sealed class InterviewTests
         var state = new InterviewState((JObject)Configuration()["schema"]);
         var invoke = state.SessionHandler();
         Assert.Throws<InvalidOperationException>(() => state.ValidateComplete(state.Snapshot()));
+        Assert.That(state.IsComplete, Is.False);
         state.AcceptTools(true);
         foreach (string field in new[] { "username", "style", "ai_name" })
             invoke("config_set", new JObject { ["field"] = field, ["value"] = "first" });
+        Assert.That(state.IsComplete, Is.True, "Only the three required interview fields determine completion.");
+        state.AcceptTools(false);
+        Assert.That(state.IsComplete, Is.True, "Revoking tools must not undo completion.");
+        state.AcceptTools(true);
         invoke("config_set", new JObject { ["field"] = "username", ["value"] = "corrected" });
         Assert.That(state.Missing().Count, Is.Zero);
         state.ValidateComplete(state.Snapshot());
@@ -107,8 +112,149 @@ public sealed class InterviewTests
         await Task.Run(() =>
         {
             using (var detector = new SileroDetector((JObject)config["vad"]))
+            {
+                detector.SetNoiseFloor(0.004);
                 for (int i = 0; i < 100; i++) Assert.That(detector.Process(new float[320]), Is.False);
+            }
         });
+    }
+
+    [Test]
+    public void Calibration_UsesSampleDurationMedianAndDoesNotMutatePcm()
+    {
+        var calibration = new NoiseFloorCalibration(320, 0.6, 4);
+        var block = new float[320];
+        for (int i = 0; i < block.Length; i++) block[i] = 0.001f;
+        for (int i = 0; i < 29; i++) calibration.Add(block);
+        Assert.That(calibration.IsComplete, Is.False);
+        var transient = new float[320];
+        for (int i = 0; i < transient.Length; i++) transient[i] = 0.5f;
+        calibration.Add(transient);
+        Assert.That(calibration.IsComplete, Is.True);
+        Assert.That(calibration.Threshold, Is.EqualTo(0.004).Within(0.000001));
+        foreach (float sample in block) Assert.That(sample, Is.EqualTo(0.001f));
+        foreach (float sample in transient) Assert.That(sample, Is.EqualTo(0.5f));
+    }
+
+    [Test]
+    public void Calibration_EvenMedianAndSilentRoomAreHandled()
+    {
+        var calibration = new NoiseFloorCalibration(160, 0.02, 4);
+        var first = new float[160];
+        var second = new float[160];
+        for (int i = 0; i < first.Length; i++) { first[i] = 0.001f; second[i] = 0.003f; }
+        calibration.Add(first);
+        calibration.Add(second);
+        Assert.That(calibration.Threshold, Is.EqualTo(0.008).Within(0.000001));
+        var silent = new NoiseFloorCalibration(320, 0.02, 4);
+        silent.Add(new float[320]);
+        Assert.That(silent.Threshold, Is.Zero);
+    }
+
+    [Test]
+    public void Calibration_BelowFloorNeverBoostsButSpeechRetainsBoundedGain()
+    {
+        Assert.That(NoiseFloorCalibration.InputGain(0.001, 0.001, 0.002, 0.004, 0.1, 0.5, 100), Is.EqualTo(1));
+        Assert.That(NoiseFloorCalibration.InputGain(0.004, 0.004, 0.008, 0.004, 0.1, 0.5, 100), Is.EqualTo(1));
+        Assert.That(NoiseFloorCalibration.InputGain(0.01, 0.01, 0.02, 0.004, 0.1, 0.5, 100), Is.EqualTo(10));
+        Assert.That(NoiseFloorCalibration.InputGain(0, 0, 0, 0, 0.1, 0.5, 100), Is.EqualTo(1));
+        Assert.That(NoiseFloorCalibration.InputGain(0.3, 0.3, 1, 0.4, 0.1, 0.5, 100), Is.EqualTo(0.5));
+    }
+
+    [Test]
+    public void Capture_Native48kBlocksPreserve16kSampleTimingAcrossBoundaries()
+    {
+        var native = new float[960];
+        var output = new float[320];
+        for (int block = 0; block < 3; block++)
+        {
+            for (int i = 0; i < native.Length; i++) native[i] = block * native.Length + i;
+            MicrophoneResampler.ConvertBlock(native, output);
+            for (int i = 0; i < output.Length; i++)
+                Assert.That(output[i], Is.EqualTo(block * 960 + i * 3));
+        }
+    }
+
+    [Test]
+    public void Capture_Native44100BlockInterpolatesWithoutChangingDuration()
+    {
+        var native = new float[882];
+        var output = new float[320];
+        for (int i = 0; i < native.Length; i++) native[i] = i;
+        MicrophoneResampler.ConvertBlock(native, output);
+        for (int i = 0; i < output.Length; i++)
+            Assert.That(output[i], Is.EqualTo(i * 44100f / 16000f).Within(0.001f));
+    }
+
+    [Test]
+    public void Capture_OnsetsAndUtterancesRemainOrderedAcrossOnePoll()
+    {
+        var handoff = new CaptureHandoff();
+        byte[] first = { 1, 0 }, second = { 2, 0 };
+        handoff.PublishOnset();
+        handoff.PublishUtterance(first);
+        handoff.PublishOnset();
+        handoff.PublishUtterance(second);
+        Assert.That(handoff.TryTake(out byte[] onset), Is.True);
+        Assert.That(onset, Is.Null);
+        Assert.That(handoff.TryTake(out byte[] pcm), Is.True);
+        Assert.That(pcm, Is.SameAs(first));
+        Assert.That(handoff.TryTake(out onset), Is.True);
+        Assert.That(onset, Is.Null);
+        Assert.That(handoff.TryTake(out pcm), Is.True);
+        Assert.That(pcm, Is.SameAs(second));
+        Assert.That(handoff.HasPendingEvents, Is.False);
+    }
+
+    [Test]
+    public async Task Capture_DequeuedBlockRemainsPendingUntilWorkerPublishesEvents()
+    {
+        var handoff = new CaptureHandoff();
+        var entered = new TaskCompletionSource<bool>();
+        var release = new TaskCompletionSource<bool>();
+        handoff.QueueSamples(320);
+        Task worker = Task.Run(async () =>
+        {
+            entered.SetResult(true);
+            await release.Task;
+            handoff.PublishOnset();
+            handoff.ProcessedSamples(320);
+        });
+        await entered.Task;
+        try
+        {
+            Assert.That(handoff.IsProcessing, Is.True);
+            Assert.That(handoff.HasPendingEvents, Is.False);
+        }
+        finally { release.SetResult(true); await worker; }
+        Assert.That(handoff.IsProcessing, Is.False);
+        Assert.That(handoff.HasPendingEvents, Is.True);
+    }
+
+    [Test]
+    public void Capture_OverflowIsExplicitAndPollingReleasesCapacity()
+    {
+        var handoff = new CaptureHandoff();
+        handoff.PublishUtterance(new byte[2]);
+        handoff.PublishUtterance(new byte[2]);
+        Assert.Throws<InvalidOperationException>(() => handoff.PublishUtterance(new byte[2]));
+        Assert.That(handoff.TryTake(out _), Is.True);
+        Assert.DoesNotThrow(() => handoff.PublishUtterance(new byte[2]));
+    }
+
+    [Test]
+    public void Speech_DiagnosticWavePreservesExactUploadedPcmAndSampleRate()
+    {
+        byte[] pcm = { 0, 0, 255, 127, 0, 128, 1, 0 };
+        byte[] wav = SpeechDiagnostics.Wave(pcm, 16000);
+        Assert.That(System.Text.Encoding.ASCII.GetString(wav, 0, 4), Is.EqualTo("RIFF"));
+        Assert.That(System.Text.Encoding.ASCII.GetString(wav, 8, 4), Is.EqualTo("WAVE"));
+        Assert.That(BitConverter.ToInt32(wav, 24), Is.EqualTo(16000));
+        Assert.That(BitConverter.ToInt16(wav, 22), Is.EqualTo(1));
+        Assert.That(BitConverter.ToInt32(wav, 40), Is.EqualTo(pcm.Length));
+        var payload = new byte[pcm.Length];
+        Array.Copy(wav, 44, payload, 0, payload.Length);
+        Assert.That(payload, Is.EqualTo(pcm));
     }
 
     [Test]

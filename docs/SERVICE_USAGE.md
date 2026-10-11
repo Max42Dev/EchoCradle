@@ -1,11 +1,15 @@
 # Local service and voice experiment usage
 
-**Status:** implemented bounded first slice, **2026-10-06**. Source of truth:
+**Status:** implemented bounded slice, contract updated **2026-10-10**. Source of truth:
 [`service.py`](../orchestrator/orchestrator/service.py),
 [`client.py`](../orchestrator/orchestrator/client.py) and
 [`service_protocol.py`](../orchestrator/orchestrator/service_protocol.py).
 The broader [Unity service design](ORCHESTRATOR_SERVICE.md) is a design reference,
-not this slice's wire contract. No Unity client is implemented.
+not this slice's wire contract. The [Unity client](../Unity/README.md) is
+implemented, with typed canonical jobs/tool outcomes and passing offline
+EditMode transport tests. Python's application entry is
+`orchestrator.client.ServiceClient`; import it explicitly with the `service`
+extra installed. Importing `orchestrator` alone does not require client extras.
 
 ## Install and prerequisites
 
@@ -157,14 +161,14 @@ depth and unknown spec fields rejected. No compatibility translation is provided
 | `GET /v1/health/live` | Instance/protocol identity; not proof models are ready. |
 | `GET /v1/health/ready` | 200 when the entire configured profile is ready; otherwise 503, state and startup error. |
 | `GET /v1/capabilities` | Cached-only status, planned/actual models, kind readiness, limits and feature flags. No downloads. |
-| `POST /v1/sessions` | 201; accepts `tools` (native function declarations) and `delivery_mode` (`text`, `speech`, `both`; default `text`). Returns session ID/events path. Delivery mode does not implement a ledger. |
+| `POST /v1/sessions` | 201; accepts only `tools` (native function declarations, default `[]`). Returns session ID/events path. |
 | `DELETE /v1/sessions/{id}` | Cancels session jobs and closes its socket. |
 | `POST /v1/jobs` | 202 after validation/quota admission; inference runs in a worker lane. |
-| `GET /v1/jobs/{id}` | Snapshot: state, revision, `host_pending`, result/error and selected-model diagnostics. |
-| `POST /v1/jobs/{id}/cancel` | Logical cancellation; native work may still be pending. |
+| `GET /v1/jobs/{id}` | Canonical snapshot, shared with submit/cancel and `job.state`: version, instance/session/job/turn identity, kind, state, revision, `host_pending`, result/error and `selected_model` diagnostics. |
+| `POST /v1/jobs/{id}/cancel` | Same canonical snapshot; logical cancellation, native work may still be pending. |
 | `POST /v1/artifacts` | 201; raw PCM16 little-endian mono, `Content-Type: application/octet-stream`, `X-Sample-Rate: 16000`, 1..480,000 samples (30 s / 960,000 bytes). Returns artifact ID. |
 | `GET /v1/artifacts/{id}` | Raw PCM, sample rate/count, SHA-256 and ETag headers. Not WAV; no range contract. |
-| `DELETE /v1/artifacts/{id}` | Release published PCM storage; repeated deletion returns 404. The client deletes verified TTS artifacts immediately. |
+| `DELETE /v1/artifacts/{id}` | Release published PCM storage; repeated deletion returns 404. The client attempts deletion after verifying TTS; failed cleanup does not discard usable audio. |
 | `POST /v1/control/shutdown` | 202 drain when configured `spawned_owner=True`; same service bearer token authorizes it. |
 
 ### Exact `JobSpec`
@@ -173,7 +177,7 @@ Only these fields are accepted; `kind` is required:
 
 | Field | Default / restriction |
 | --- | --- |
-| `kind` | `text`, `dialogue`, `tts`, `stt`. Other kinds rejected. |
+| `kind` | `text`, `tts`, `stt`. Other kinds, including the removed `dialogue`, rejected. |
 | `session_id`, `turn_id` | Optional UUIDs; a turn requires a session. |
 | `messages` | `[]`; at most 64 objects with exactly `role` and `content`. Roles: `system`, `user`, `assistant`; content ≤16,384 characters. |
 | `text` | Optional nonempty string; ≤300 characters for TTS, otherwise ≤16,384. |
@@ -182,15 +186,19 @@ Only these fields are accepted; `kind` is required:
 | `temperature` | 0.7; finite number 0..2. |
 | `deadline_ms` | 30,000; integer 1,000..120,000, including queue time. |
 | `idempotency_key` | Optional nonempty string ≤128 characters, scoped to session/instance. |
-| `streaming` | `false`; boolean, only text/dialogue. Requires a negotiated session socket. |
-| `json_schema` | Optional object, text jobs only (streaming or not). Valid JSON Schema, ≤16 KiB; references are rejected. Grammar constrains generation; final output is validated. |
+| `streaming` | `false`; boolean, only text. Requires a negotiated session socket. |
+| `json_schema` | Optional schema object, text jobs only (streaming or not). Valid JSON Schema, ≤16 KiB; references are rejected. Grammar constrains generation; bounded final JSON values (object, array or scalar roots) are validated. Tool-enabled sessions cannot combine it with tools. |
 
-`text`/`dialogue` require messages or text; supplied text is appended as a user
-message. **Dialogue is the text/tool lane, not an automatic STT → TTS voice
-pipeline.** TTS requires text, no messages or streaming. STT requires an uploaded
+`text` requires messages or text; supplied text is appended as a user
+message. There is no automatic STT → text → TTS voice-pipeline job.
+TTS requires text, no messages or streaming. STT requires an uploaded
 PCM artifact, no text/messages/streaming; submission consumes the input artifact.
 TTS/STT require the voice profile. Text jobs in a session with permitted tools
 also require a negotiated socket, even if `streaming=false`.
+`json_schema` with a tool-enabled session fails `INVALID_SPEC` rather than
+silently bypassing tools. Request/event envelopes remain JSON objects even when
+generated JSON has an array/scalar root; text results contain the serialized
+JSON string, not a decoded application value.
 
 Example accepted standalone text submission body:
 
@@ -198,9 +206,14 @@ Example accepted standalone text submission body:
 {"kind":"text","text":"Tell me about this town.","max_tokens":128,"temperature":0.7,"deadline_ms":30000,"streaming":false}
 ```
 
-There are **no `input`, `output`, `seed`, `model_id` or speaker job fields**.
+There are **no `input`, `output`, `seed`, `model_id` or speaker job fields**,
+and session `delivery_mode` is removed. Unknown fields are rejected, not translated.
 Text results contain `text` and `calls`; TTS results contain
 `artifact_id`, `sample_rate`, `sample_count`, `sha256`; STT results contain `text`.
+Each text call record contains `id` (model-call identity, possibly null),
+`dispatch_id` (nullable UUID), `name`, `arguments`, `result`, `outcome`
+(`rejected`, `completed`, `unknown`) and `result_delivered`. Result and complete
+REST/WebSocket envelope byte budgets are checked before declaring success.
 
 ### JSON WebSocket and remote tools
 
@@ -223,17 +236,88 @@ call per session, four generation rounds, at most eight calls/job, 16 KiB tool
 arguments/results and a 5 s result timeout. Late/duplicate results cannot resume
 cancelled work; a timeout after dispatch means the action outcome is unknown.
 The client has bounded per-turn call-ID deduplication, not a durable action ledger.
+Socket `tool.call.call_id` and `tool.result.call_id` are dispatch UUIDs, **not**
+model-call IDs. Final job snapshots include rejected attempts that never reached
+the client and interrupted/unknown attempts, not just locally dispatched calls.
 
-### Python client with native tools
+### Python application client
 
-`ServiceClient.chat_with_tools(messages, registry)` returns `(text, calls)`.
-`stream_chat_with_tools(messages, registry, on_text=callback, should_stop=stop)`
-additionally streams spoken text and supports cancellation. Descriptions and
-schemas come from `ToolRegistry.specs()` and are supplied to native tool calling
-on every generation round. Tool choice is automatic, never required. Complete
-calls execute through `registry.invoke()` in the client; results return to the
-model for continuation. The server has no game-specific tool implementations.
+Connection ownership is explicit:
 
+```python
+import threading
+
+from orchestrator.client import ServiceClient, ServiceClientError
+from orchestrator.client_types import Capabilities, Message, TextResult
+
+messages: list[Message] = [{"role": "user", "content": "Tell me about this town."}]
+cancellation = threading.Event()
+with ServiceClient.start_owned(profile="text") as client:
+  capabilities: Capabilities = client.capabilities()
+  try:
+    result: TextResult = client.stream_chat(
+      messages, on_text=lambda delta: print(delta, end="", flush=True),
+      cancellation=cancellation, timeout=30,
+    )
+    if result.state == "succeeded":
+      print(result.text)
+    else:
+      print("Cancelled", result.job_id)
+  except ServiceClientError as error:
+    print(error.code, error.status, error.retryable, error.job_id, error.phase)
+```
+
+Use `ServiceClient.attach("http://127.0.0.1:5010")` to attach with the inherited
+environment token; an explicit `token` may instead come from a trusted secret
+source. Attachment never acquires process ownership or changes startup policy.
+`start_owned(profile="text" | "voice", ...)` waits for cached readiness and
+owns shutdown. Missing cached deployments fail, never provision.
+
+`chat(messages, ...)`, `stream_chat(messages, on_text=..., ...)`,
+`chat_with_tools(messages, registry, ...)` and
+`stream_chat_with_tools(messages, registry, on_text=..., ...)` all return
+`TextResult`. Streaming methods are blocking callback APIs, **not iterators**.
+The result contains terminal `state`, authoritative final or partial `text`,
+`job_id`, nullable `turn_id` and immutable tuple `calls`. Successful and confirmed
+cancelled text turns return typed outcomes; failed jobs/transport/callbacks raise
+`ServiceClientError`, optionally carrying `partial_result`. Never treat partial
+text or a cancelled turn as successful completion. No `should_stop` predicate
+is accepted by this application API: pass `cancellation=threading.Event()` and
+set it from any thread. Direct in-process hosts have a different contract.
+
+Types live in `orchestrator.client_types`: `Message`, `TextResult`, `ToolOutcome`,
+`Capabilities`, `KindCapability`, `PcmCapability` and the `ToolRegistry` protocol.
+The package root re-exports result/capability types without client imports;
+root `ToolRegistry` remains the concrete implementation from `orchestrator.tools`.
+The registry protocol requires `specs() -> list[dict[str, Any]]` (native function
+declarations) and `invoke(name, arguments) -> Any` (bounded JSON result).
+The concrete registry is compatible; applications may supply their own.
+Declarations are validated before creating a session; arbitrary validated names
+are supported, not just `config_set`. Tool choice is automatic, never required.
+Tool turns currently fix `max_rounds=4`; other values fail `UNSUPPORTED_OPTION`.
+
+`ToolOutcome` separates nullable `model_call_id` and `dispatch_id`, immutable
+`arguments`/`result`, server `outcome`, `result_delivered` and `executed_locally`.
+`completed` means the service received a result, **not successful gameplay**;
+`result_delivered` means a response was observed to a model continuation containing
+the result, **not registry receipt or a socket send**. Rejected attempts can have
+their error result delivered too. Failed/empty continuations conservatively leave
+delivery unconfirmed; this flag does not prove the model acted on the result.
+Local execution evidence is independent and can be present for an unknown
+outcome or a missing final server record. An immediate cancellation snapshot may
+lack attempts while native work remains pending; Python merges local calls and
+Unity retains `LocallyExecutedDispatchIds` separately. Cancellation/timeout never undo side
+effects; keep implementations short, idempotent where appropriate, and revocable.
+
+Exceptions preserve sanitized `code`, nullable HTTP `status`, `retryable`,
+nullable `job_id`, `phase` and optional `partial_result`; they do not expose
+arbitrary remote prose/transport exceptions. Service application, routing and
+unexpected errors share a bounded `error` envelope (`code`, `message`,
+`retryable`, `job_id`). Nonapplication HTTP/transport/protocol failures remain
+explicit client errors. `ServiceCancelledError` is available for cancellation
+errors outside a confirmed typed text result.
+
+Text callbacks and `registry.invoke` run only on the calling thread.
 Callbacks must hand off work immediately, not wait for synthesis/playback.
 The interview does so with a separate speech worker. Queued text is bounded by
 the service's per-turn token/output limits; PCM/playback remain serialized.
@@ -241,11 +325,42 @@ Plain `chat` and `stream_chat` remain available, including optional response
 schemas for applications that explicitly need structured text. The interview
 does not use a response schema or ask for JSON speech.
 
+#### Deadlines, cancellation and artifact ownership
+
+REST defaults to `deadline_ms=30000` including queue time. Python submissions
+use 120,000 ms; text methods separately accept `timeout` in `(0, 120]` seconds
+(default 120), with one monotonic total budget across session/negotiation,
+admission, polling/streaming and ordinary cleanup. Transport waits are bounded
+to the remaining budget and at most five seconds, not reset indefinitely by
+incoming bytes. Startup/readiness and owner shutdown have separate budgets.
+An expired budget or failed cancellation reconciliation raises an explicit
+error; the client does not invent confirmed remote cancellation. Best-effort
+cancel cleanup can continue on a detached bounded thread after return without
+replacing the primary failure or extending the caller's operation wait.
+
+The watcher can revoke/cancel remote work while user code is running, but Python
+cannot forcibly interrupt a synchronous callback/tool. Such code may overrun
+the total budget and has no hard return-time guarantee. An already-started
+side effect can still finish after cancellation; handle revocation in the tool.
+
+`client.tts.synthesize_samples(sentence)` returns `(float32_samples, sample_rate)`
+and chunks within a 2,400-character / 120-second combined budget, including
+artifact transport and best-effort deletion. `transcribe_samples(samples,
+rate=16000)` returns final `str` within its 120-second transport/inference budget;
+`transcribe(wav_path)` first validates/downmixes/resamples a bounded PCM16 file.
+No service STT partial callback is supported. Verified TTS audio survives failed
+deletion. Python and Unity delete unconsumed STT uploads on definite validated 4xx
+or `503 NOT_READY` admission rejection (Python also handles local validation
+failure), not arbitrary 5xx, malformed errors or ambiguous transport failures;
+TTL handles uncertain ownership. Admitted STT
+uploads are consumed by the service. Do not retry mutations blindly after an
+unknown outcome.
+
 ## Bounds, lifecycle and limitations
 
 - At most four sessions, one active job/session, 16 queued/active jobs including
   native-cancel-pending work, 256 retained jobs. Text/TTS/STT each have one worker;
-  text and dialogue share their lane. Worker lanes are threads, **not crash
+  one lane per kind. Worker lanes are threads, **not crash
   isolation**: a native crash can kill the entire service.
 - JSON event queue: 64 messages / 256 KiB, 5 s slow-consumer guard. Prompt budget
   uses conservative serialized-prompt tokenization with a 4,096-token context;
@@ -256,7 +371,7 @@ does not use a response schema or ask for JSON speech.
 - Artifact/input storage budget: 64 MiB, ≤256 published artifacts. Artifacts and
   completed jobs expire after 600 s; disconnected sessions after 60 s. Jobs,
   sessions, artifacts and idempotency records are **in memory**, lost on restart.
-  The client releases verified TTS artifacts immediately; completed job records
+  The client attempts to release verified TTS artifacts immediately; completed job records
   remain subject to the retention quota.
   The shared installed model store persists; generated service PCM does not.
 - States: queued/running/waiting_tool → succeeded/failed/cancelled. Logical cancel
@@ -267,13 +382,24 @@ does not use a response schema or ask for JSON speech.
   text callbacks/tools run on the calling thread, with independent socket-reader,
   heartbeat and cancellation threads. Do not call it on a UI/audio callback.
 - No server history/delivery reconciliation, provisioning, joint VRAM/RAM
-  admission, game telemetry, general gameplay actions, image/3D/music/SFX or
-  Unity client. Portfolio revision 1 is not proof of a jointly feasible portfolio.
+  admission, game telemetry or image/3D/music/SFX. Generic tools provide a
+  validated client action boundary, not a durable gameplay/action ledger.
+  Portfolio revision 1 is not proof of a jointly feasible portfolio.
 - STT receives completed audio and returns final text only, including when using
   an online recognizer internally. SenseVoice is offline; recognition partials
   are not exposed by this service/client. Microphone barge-in uses local VAD.
 
 ## Real-model smoke and evidence
+
+The 2026-10-10 hardening is covered by offline service/client boundary tests and
+the passing Unity EditMode suite documented in [Unity validation](../Unity/README.md#validation).
+Final Python integration audit: **369 orchestrator tests passed; 122 interview
+tests passed, 1 live-model test deselected**. No C# changes were made in that audit,
+so the preceding Unity batch result was not rerun.
+No models, audio devices, audible playback or new player build were exercised
+for this documentation/export cleanup. Final combined test totals belong to the
+integration report. The runs below are **historical 2026-10-06 evidence**, not
+a rerun of the changed contracts or proof of current native/audio behavior.
 
 From the experiment's `src` directory, choose a **new, empty output directory**:
 

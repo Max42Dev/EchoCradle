@@ -18,7 +18,7 @@ from typing import Any
 
 
 class Modality(str, Enum):
-    """What a model produces. Mirrors :class:`orchestrator.tasks.TaskKind`."""
+    """What a model produces; only implemented hosts can serve requests."""
 
     TEXT = "text"
     TTS = "tts"

@@ -38,6 +38,18 @@ namespace EchoCradle.Interview
         }
 
         public void AcceptTools(bool accepting) { lock (_sync) _accepting = accepting; }
+        public bool IsComplete
+        {
+            get
+            {
+                lock (_sync)
+                {
+                    foreach (JToken requiredField in (JArray)_schema["required"])
+                        if (!Recorded(_values, (string)requiredField)) return false;
+                    return true;
+                }
+            }
+        }
         public Func<string, JObject, JObject> SessionHandler()
         {
             int generation;
@@ -57,7 +69,7 @@ namespace EchoCradle.Interview
             {
                 var missing = new JArray();
                 foreach (JToken field in (JArray)_schema["required"])
-                    if (string.IsNullOrWhiteSpace((string)_values[(string)field])) missing.Add(field.DeepClone());
+                    if (!Recorded(_values, (string)field)) missing.Add(field.DeepClone());
                 return missing;
             }
         }
@@ -108,10 +120,15 @@ namespace EchoCradle.Interview
             return true;
         }
 
+        private bool Recorded(JObject values, string field) =>
+            values[field]?.Type == JTokenType.String && Valid(field, (string)values[field]) &&
+            ((int?)_schema["properties"][field]["minLength"] == 0 ||
+                !string.IsNullOrWhiteSpace((string)values[field]));
+
         public void ValidateComplete(JObject values)
         {
             foreach (JToken field in (JArray)_schema["required"])
-                if (values[(string)field]?.Type != JTokenType.String || string.IsNullOrWhiteSpace((string)values[(string)field]))
+                if (!Recorded(values, (string)field))
                     throw new InvalidOperationException("Incomplete interview.");
             foreach (JProperty field in values.Properties())
                 if (field.Value.Type != JTokenType.String || !Valid(field.Name, (string)field.Value))

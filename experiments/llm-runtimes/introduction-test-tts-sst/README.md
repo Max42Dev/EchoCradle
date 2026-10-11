@@ -13,18 +13,19 @@ Slow Kokoro synthesis and playback never block the network consumer: sentence
 callbacks hand off bounded-per-turn text immediately to the speech worker.
 Cancellation and spoken-delivery bookkeeping remain client-owned.
 
-**Status:** bounded service/client slice implemented; real-model offline smoke passed
-**Date:** 2026-10-06 (historical in-process findings began 2026-09-30)
+**Status:** bounded service/client slice implemented; historical real-model offline smoke passed
+**Current contract:** 2026-10-10 (historical smoke 2026-10-06; in-process findings began 2026-09-30)
 **Author:** agent
 
 `src/main.py` is now the **service-client entrypoint**: it automatically starts
 one contained owner service (or attaches with `--service-url`). Models and the
 llama.cpp runtime must already be cached; **no fresh downloads occur on this
 launch path**. REST carries jobs and complete PCM artifacts; JSON WebSocket
-carries text and remote compiled `config_set` calls. Capture, local VAD,
+carries text and application-defined tool calls (`config_set` in this interview). Capture, local VAD,
 playback and delivery/history bookkeeping stay in the Python client.
 There is no binary WebSocket/credit transport, server history reconciliation,
-joint resource admission/provisioning or Unity client. Native service speech
+or joint resource admission/provisioning. A separate Unity client/interview now
+exists; see [Unity usage and tests](../../../Unity/README.md). Native service speech
 crashes can terminate the whole process despite its three worker lanes.
 
 See [precise service usage](../../../docs/SERVICE_USAGE.md) and the
@@ -32,6 +33,27 @@ See [precise service usage](../../../docs/SERVICE_USAGE.md) and the
 Historical `diagnostic_run.py`, `diagnose_*.py`, model benchmarks and hardware
 tests below are explicitly **in-process model/device experiments**, not the
 current main entrypoint or cached-only service setup instructions.
+
+### Current application contract (2026-10-10)
+
+The service entry explicitly uses `ServiceClient.start_owned(...)` or
+`ServiceClient.attach(...)`. Text/tool methods return `TextResult`, not a string
+or `(text, calls)` tuple; callback streaming is synchronous and returns a typed
+terminal result. Only successful turns finalize delivered history/config; a
+cancelled result is not a completed answer. Consumers set a `threading.Event`
+for cancellation rather than passing a `should_stop` predicate. `ToolOutcome`
+keeps server attempts/delivery and local execution separate; model-call IDs are
+not dispatch UUIDs and unknown outcomes do not undo mutations. The separate
+`local_interview.py` consumer supports direct host diagnostics without making
+the service contract pretend to match the low-level host API.
+
+Current wire kinds are `text`, `tts`, `stt`; sessions accept `tools` only.
+`dialogue`/`delivery_mode` are removed, and response schemas cannot be combined
+with tools. See [exact API and budgets](../../../docs/SERVICE_USAGE.md#python-application-client).
+Offline consumer/transport and Unity boundary tests cover these changes. This
+cleanup runs no real models, audio capture/playback or player build; earlier
+measurements below remain historical evidence. Final combined totals will be
+recorded by the integration report.
 
 ## Question
 
@@ -182,8 +204,9 @@ control loop submits bounded jobs to serialized text/TTS/STT worker lanes;
 the Python client calls and tool/text callbacks are still synchronous on their
 calling thread. The experiment coordinates local voice interruption/playback.
 Preferred SenseVoice decodes a completed utterance, with no service partials.
-The exact implemented `JobSpec` supports text/dialogue/tts/stt and differs from
-the original design; see [usage](../../../docs/SERVICE_USAGE.md#exact-jobspec).
+That run used the then-current text/dialogue/tts/stt `JobSpec`; today's contract
+supports text/tts/stt only and differs from the original design; see
+[usage](../../../docs/SERVICE_USAGE.md#exact-jobspec).
 
 Real service smoke **passed**, recorded in `out/service_smoke_peter/report.json`:
 Granite 4.2-8B / Kokoro (speaker 7) / SenseVoice produced a validated config with

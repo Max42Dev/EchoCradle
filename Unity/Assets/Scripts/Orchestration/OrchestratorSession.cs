@@ -17,6 +17,7 @@ namespace EchoCradle.Orchestration
         private readonly string _id;
         private readonly Func<string, JObject, JObject> _handler;
         private readonly HashSet<string> _names;
+        private readonly Dictionary<string, JObject> _schemas;
         private readonly ClientWebSocket _socket = new ClientWebSocket();
         private readonly CancellationTokenSource _stop;
         private readonly SemaphoreSlim _send = new SemaphoreSlim(1, 1);
@@ -24,6 +25,7 @@ namespace EchoCradle.Orchestration
         private readonly BlockingCollection<JObject> _events = new BlockingCollection<JObject>(64);
         private readonly object _sync = new object();
         private readonly HashSet<string> _seen = new HashSet<string>();
+        private readonly HashSet<string> _executed = new HashSet<string>();
         private readonly TaskCompletionSource<bool> _hello = NewSignal();
         private TaskCompletionSource<bool> _end;
         private Task _reader, _consumer, _heartbeat;
@@ -34,17 +36,19 @@ namespace EchoCradle.Orchestration
         private long _sequence = 1;
         private int _queuedBytes, _textBytes;
         private bool _pendingTool;
+        private string _partialText = "";
 
         private static TaskCompletionSource<bool> NewSignal() =>
             new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         private OrchestratorSession(OrchestratorClient client, string id,
-            Func<string, JObject, JObject> handler, HashSet<string> names)
+            Func<string, JObject, JObject> handler, HashSet<string> names, Dictionary<string, JObject> schemas)
         {
             _client = client;
             _id = id;
             _handler = handler;
             _names = names;
+            _schemas = schemas;
             _stop = CancellationTokenSource.CreateLinkedTokenSource(client.Lifetime);
             _socket.Options.Proxy = null;
             _socket.Options.SetRequestHeader("Authorization", "Bearer " + client.Token);
@@ -59,6 +63,7 @@ namespace EchoCradle.Orchestration
             var copy = (JArray)tools.DeepClone();
             OrchestratorWire.Encode(new JObject { ["tools"] = copy }, OrchestratorWire.ToolLimit);
             var names = new HashSet<string>();
+            var schemas = new Dictionary<string, JObject>();
             foreach (JToken declaration in copy)
             {
                 if (!(declaration is JObject tool) || (string)tool["type"] != "function" ||
@@ -71,6 +76,8 @@ namespace EchoCradle.Orchestration
                     if (!(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') &&
                         !(c >= '0' && c <= '9') && c != '_' && c != '-')
                         throw new OrchestratorException("INVALID_TOOLS");
+                    OrchestratorToolSchema.ValidateSchema(schema);
+                    schemas.Add(name, schema);
                 // The server validates the full schema; reject reference-bearing declarations locally too.
                 foreach (JToken node in schema.DescendantsAndSelf())
                     if (node is JProperty property && (property.Name == "$ref" ||
@@ -79,10 +86,10 @@ namespace EchoCradle.Orchestration
             }
             JObject created = await client.JsonAsync(HttpMethod.Post, "/v1/sessions", new JObject
             {
-                ["tools"] = copy, ["delivery_mode"] = "text"
+                ["tools"] = copy
             }, token, true).ConfigureAwait(false);
             string id = OrchestratorWire.Id(created["session_id"]);
-            var session = new OrchestratorSession(client, id, handler, names);
+            var session = new OrchestratorSession(client, id, handler, names, schemas);
             try
             {
                 using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(token, session._stop.Token))
@@ -124,11 +131,11 @@ namespace EchoCradle.Orchestration
             }
         }
 
-        private void Fail(string code)
+        private void Fail(string code, OrchestratorException error = null)
         {
             lock (_sync)
             {
-                if (_error == null) _error = new OrchestratorException(code);
+                if (_error == null) _error = error ?? new OrchestratorException(code);
                 _turnStop?.Cancel();
                 _hello.TrySetResult(true);
                 _end?.TrySetResult(true);
@@ -218,7 +225,7 @@ namespace EchoCradle.Orchestration
                             continue;
                         }
                         if (type == "pong") continue;
-                        if (type == "error") throw new OrchestratorException("SOCKET_PROTOCOL_ERROR");
+                        if (type == "error") throw OrchestratorWire.Error(payload["error"] as JObject, null, "socket");
                         if (type != "text.delta" && type != "text.end" && type != "tool.call" && type != "job.state")
                             throw new OrchestratorException("PROTOCOL_ERROR");
                         lock (_sync)
@@ -233,7 +240,9 @@ namespace EchoCradle.Orchestration
                                     (string)payload["session_id"] != _id)
                                     throw new OrchestratorException("PROTOCOL_ERROR");
                                 string state = OrchestratorWire.Text(payload["state"], 32);
-                                if (state == "failed" || state == "cancelled") _turnStop?.Cancel();
+                                var snapshot = new OrchestratorJob(payload);
+                                if ((string)payload["service_instance_id"] != _client.Instance)
+                                    throw new OrchestratorException("INSTANCE_CHANGED");
                             }
                             if (type == "tool.call")
                             {
@@ -244,6 +253,7 @@ namespace EchoCradle.Orchestration
                                     throw new OrchestratorException("PROTOCOL_ERROR");
                                 OrchestratorWire.Integer(payload["timeout_ms"], 5000, 5000);
                                 OrchestratorWire.Encode(payload["arguments"], OrchestratorWire.ToolLimit);
+                                OrchestratorToolSchema.ValidateArguments(_schemas[(string)payload["name"]], payload["arguments"]);
                                 _pendingTool = true;
                                 // Monotonic local timestamp includes time spent waiting in our event queue.
                                 data["received_ticks"] = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -253,6 +263,7 @@ namespace EchoCradle.Orchestration
                                 string delta = OrchestratorWire.Text(payload["text"]);
                                 _textBytes += OrchestratorWire.Utf8.GetByteCount(delta);
                                 if (_textBytes > 24576) throw new OrchestratorException("PAYLOAD_LIMIT");
+                                _partialText += delta;
                             }
                             int size = OrchestratorWire.Encode(data).Length;
                             if (_queuedBytes + size > 262144 || !_events.TryAdd(data))
@@ -263,7 +274,7 @@ namespace EchoCradle.Orchestration
                 }
             }
             catch (OperationCanceledException) { if (!_stop.IsCancellationRequested) Fail("SOCKET_TIMEOUT"); }
-            catch (OrchestratorException error) { Fail(error.Code); }
+            catch (OrchestratorException error) { Fail(error.Code, error); }
             catch (Exception) { Fail("SOCKET_LOST"); }
         }
 
@@ -287,10 +298,11 @@ namespace EchoCradle.Orchestration
                     {
                         case "text.delta":
                             // Hand-off only: a slow/throwing callback fails the turn, not the reader.
+                            token.ThrowIfCancellationRequested();
                             callback?.Invoke((string)payload["text"]);
                             break;
                         case "job.state":
-                            if ((string)payload["state"] == "succeeded")
+                            if (new OrchestratorJob(payload).IsTerminal)
                                 lock (_sync) _end?.TrySetResult(true);
                             break;
                         case "tool.call":
@@ -300,7 +312,7 @@ namespace EchoCradle.Orchestration
                 }
             }
             catch (OperationCanceledException) { }
-            catch (OrchestratorException error) { Fail(error.Code); }
+            catch (OrchestratorException error) { Fail(error.Code, error); }
             catch (Exception) { Fail("CALLBACK_FAILED"); }
         }
 
@@ -326,6 +338,7 @@ namespace EchoCradle.Orchestration
                     try
                     {
                         timeout.Token.ThrowIfCancellationRequested();
+                        lock (_sync) _executed.Add((string)payload["call_id"]);
                         JObject result = _handler((string)payload["name"], (JObject)payload["arguments"].DeepClone());
                         if (result == null) throw new OrchestratorException("INVALID_TOOL_RESULT");
                         return (JObject)result.DeepClone();
@@ -351,58 +364,67 @@ namespace EchoCradle.Orchestration
             }
         }
 
-        internal async Task<string> DialogueAsync(JArray messages, int maxTokens, float temperature,
+        internal async Task<OrchestratorJob> TextAsync(JArray messages, int maxTokens, float temperature,
             int deadlineMs, Action<string> onDelta, CancellationToken token)
         {
             if (messages == null || messages.Count == 0 || messages.Count > 64 || maxTokens < 1 ||
                 maxTokens > 512 || float.IsNaN(temperature) || float.IsInfinity(temperature) ||
                 temperature < 0 || temperature > 2 || deadlineMs < 1000 || deadlineMs > 120000)
-                throw new OrchestratorException("INVALID_DIALOGUE");
+                throw new OrchestratorException("INVALID_TEXT");
             foreach (JToken item in messages)
             {
                 if (!(item is JObject message) || message.Count != 2 ||
                     (string)message["role"] != "system" && (string)message["role"] != "user" &&
-                    (string)message["role"] != "assistant") throw new OrchestratorException("INVALID_DIALOGUE");
+                    (string)message["role"] != "assistant") throw new OrchestratorException("INVALID_TEXT");
                 OrchestratorWire.Text(message["content"], 16384);
             }
             using (var linked = CancellationTokenSource.CreateLinkedTokenSource(token, _stop.Token))
             {
+                var clock = System.Diagnostics.Stopwatch.StartNew();
+                linked.CancelAfter(deadlineMs);
                 await _turnGate.WaitAsync(linked.Token).ConfigureAwait(false);
                 bool succeeded = false;
                 try
                 {
                     Check();
+                    int remaining = deadlineMs - (int)clock.ElapsedMilliseconds;
+                    if (remaining < 1000) throw new OrchestratorException("DEADLINE_EXCEEDED", phase: "operation");
                     lock (_sync)
                     {
                         _turn = Guid.NewGuid().ToString("D");
                         _job = null;
                         _seen.Clear();
+                        _executed.Clear();
                         _pendingTool = false;
                         _textBytes = 0;
+                        _partialText = "";
                         _delta = onDelta;
                         _end = NewSignal();
                         _turnStop = CancellationTokenSource.CreateLinkedTokenSource(linked.Token);
-                        _turnStop.CancelAfter(deadlineMs);
+                        _turnStop.CancelAfter(remaining);
                     }
                     JObject result = await _client.RunJobAsync(new JObject
                     {
-                        ["kind"] = "dialogue", ["session_id"] = _id, ["turn_id"] = _turn,
+                        ["kind"] = "text", ["session_id"] = _id, ["turn_id"] = _turn,
                         ["messages"] = messages, ["max_tokens"] = maxTokens, ["temperature"] = temperature,
-                        ["deadline_ms"] = deadlineMs, ["streaming"] = true, ["idempotency_key"] = _turn
-                    }, _turnStop.Token, id =>
+                        ["deadline_ms"] = remaining, ["streaming"] = true, ["idempotency_key"] = _turn
+                    }, token, id =>
                     {
                         lock (_sync)
                         {
                             if (_job != null && _job != id) throw new OrchestratorException("PROTOCOL_ERROR");
                             _job = id;
                         }
-                    }, Check).ConfigureAwait(false);
+                    }, Check, true).ConfigureAwait(false);
+                    OrchestratorJob final;
+                    lock (_sync) final = new OrchestratorJob(result, _executed, _partialText);
+                    if (final.State != "succeeded") return final;
                     // Drain preceding deltas before the caller can start the next turn.
                     await WaitAsync(_end.Task, _turnStop.Token).ConfigureAwait(false);
                     Check();
-                    string text = OrchestratorWire.Text(result["text"]);
+                    lock (_sync) final = new OrchestratorJob(result, _executed, _partialText);
                     succeeded = true;
-                    return text;
+                    return final;
                 }
                 catch (OperationCanceledException)
                 {
@@ -412,7 +434,7 @@ namespace EchoCradle.Orchestration
                     throw new OrchestratorException("TURN_CANCELLED");
                 }
                 catch (OrchestratorException) { throw; }
-                catch (Exception) { throw new OrchestratorException("DIALOGUE_FAILED"); }
+                catch (Exception) { throw new OrchestratorException("TEXT_FAILED"); }
                 finally
                 {
                     lock (_sync)

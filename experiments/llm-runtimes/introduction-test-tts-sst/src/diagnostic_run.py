@@ -17,6 +17,7 @@ from unittest.mock import patch
 import numpy as np
 
 import main as app
+from consumer_results import json_value
 
 
 class SessionCapture:
@@ -32,7 +33,8 @@ class SessionCapture:
     def event(self, kind: str, **data: Any) -> None:
         payload = {"event": kind, "elapsed_s": time.monotonic() - self.started, **data}
         with self._lock:
-            self._events.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+            self._events.write(json.dumps(json_value(payload), ensure_ascii=False,
+                                          default=str) + "\n")
             self._events.flush()
 
     def close(self) -> None:
@@ -173,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
     capture = SessionCapture(directory)
     original_turn = app._run_turn
     original_listen = app._listen
-    base_orchestrator = app.ModelOrchestrator
+    base_orchestrator = app.ServiceClient
     base_recorder = app.ContinuousRecorder
     recorders: list[Any] = []
 
@@ -214,12 +216,19 @@ def main(argv: list[str] | None = None) -> int:
                               sample_rate=rate, float32_path=target.with_suffix(".npy"),
                               wav_path=target.with_suffix(".wav"))
 
-            self.stt.on_decode_audio = decode_audio
-            original = self.text.stream_chat_with_tools
+            original_transcribe = self.transcribe_samples
+
+            def transcribe_samples(audio: Any, *, rate: int = 16000, **options: Any) -> str:
+                decode_audio(audio, rate)
+                return original_transcribe(audio, rate=rate, **options)
+
+            self.transcribe_samples = transcribe_samples
+            original = self.stream_chat_with_tools
 
             def stream(messages: Any, registry: Any, **options: Any) -> Any:
                 capture.event("model_request", messages=messages,
-                              options={k: v for k, v in options.items() if not callable(v)})
+                              options={k: v for k, v in options.items()
+                                       if not callable(v) and k != "cancellation"})
                 chunks: list[str] = []
                 callback = options.get("on_text")
 
@@ -233,13 +242,15 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     result = original(messages, registry, **options)
                     capture.event("model_result", generated_text="".join(chunks),
-                                  returned_text=result[0], tool_calls=result[1])
+                                  returned_text=result.text, state=result.state,
+                                  job_id=result.job_id, turn_id=result.turn_id,
+                                  tool_calls=result.calls)
                     return result
                 except BaseException as exc:
                     capture.event("model_error", generated_text="".join(chunks), error=repr(exc))
                     raise
 
-            self.text.stream_chat_with_tools = stream
+            self.stream_chat_with_tools = stream
 
     class TracedRecorder(base_recorder):
         def start(self) -> bool:
@@ -347,7 +358,7 @@ def main(argv: list[str] | None = None) -> int:
     with (directory / "transcript.log").open("w", encoding="utf-8") as transcript:
         with patch.object(sys, "stdout", Tee(sys.stdout, transcript)), \
              patch.object(sys, "stderr", Tee(sys.stderr, transcript)), \
-             patch.object(app, "ModelOrchestrator", TracedOrchestrator), \
+             patch.object(app, "ServiceClient", TracedOrchestrator), \
              patch.object(app, "ContinuousRecorder", TracedRecorder), \
              patch.object(app, "AudioPlayer", TracedPlayer), \
              patch.object(app, "_run_turn", run_turn), \

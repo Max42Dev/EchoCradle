@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -44,6 +45,8 @@ from orchestrator.errors import OrchestratorError  # noqa: E402
 
 from config_schema import CONFIG_SCHEMA  # noqa: E402
 from interview import Interview  # noqa: E402
+from consumer_results import json_value  # noqa: E402
+from local_interview import LocalInterviewText  # noqa: E402
 
 OUT = Path(__file__).resolve().parent.parent / "out" / "trace"
 LOG = OUT / "trace.log"
@@ -101,7 +104,7 @@ def _run(mo: ModelOrchestrator, seconds: float, log: _Tee) -> int:
     tool = JsonConfigTool(CONFIG_SCHEMA, name="config")
     registry = ToolRegistry()
     tool.register_into(registry)
-    interview = Interview(mo, tool, registry, max_turns=20)
+    interview = Interview(LocalInterviewText(mo), tool, registry, max_turns=20)
 
     # Record the exact messages the model is given, by wrapping the host call.
     original = mo.text.stream_chat_with_tools
@@ -122,6 +125,7 @@ def _run(mo: ModelOrchestrator, seconds: float, log: _Tee) -> int:
     try:
         while time.monotonic() < deadline:
             spoken: list[str] = []
+            cancelled = threading.Event()
 
             def on_sentence(sentence: str) -> None:
                 spoken.append(sentence)
@@ -132,19 +136,35 @@ def _run(mo: ModelOrchestrator, seconds: float, log: _Tee) -> int:
             def should_stop() -> bool:
                 # Only armed once the AI has spoken: polling during generation
                 # would abort the model before it says a word.
-                return bool(spoken) and recorder.speech_detected()
+                if bool(spoken) and recorder.speech_detected():
+                    cancelled.set()
+                return cancelled.is_set()
+
+            watching = threading.Event()
+
+            def watch() -> None:
+                while not watching.wait(0.01):
+                    if should_stop():
+                        return
 
             recorder.reset()
-            if opening:
-                turn, interrupted = interview.opening_streaming(on_sentence, should_stop)
-                opening = False
-            else:
+            if not opening:
                 reply = _listen(mo, recorder, log, turn_index)
                 if reply.lower() in {"quit", "exit"}:
                     break
-                turn, interrupted = interview.respond_streaming(
-                    reply or "(no answer)", on_sentence, should_stop
-                )
+            watcher = threading.Thread(target=watch, name="trace-barge-in")
+            watcher.start()
+            try:
+                if opening:
+                    turn, interrupted = interview.opening_streaming(on_sentence, cancelled)
+                    opening = False
+                else:
+                    turn, interrupted = interview.respond_streaming(
+                        reply or "(no answer)", on_sentence, cancelled
+                    )
+            finally:
+                watching.set()
+                watcher.join()
             turn_index += 1
 
             if interrupted:
@@ -156,7 +176,7 @@ def _run(mo: ModelOrchestrator, seconds: float, log: _Tee) -> int:
                     log("  [barge-in] stopped during playback")
 
             for call in turn.tool_calls:
-                log(f"  [tool] {call.name}({json.dumps(call.arguments)})")
+                log(f"  [tool] {call.name}({json.dumps(json_value(call.arguments))})")
             log(f"  config={tool.data} missing={tool.missing()}")
             if turn.done or interview.complete:
                 log("  COMPLETE")

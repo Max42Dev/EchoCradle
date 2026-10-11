@@ -8,7 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 
-from main import AudioPlayer, ContinuousRecorder, ModelOrchestrator, Modality
+from main import AudioPlayer, ContinuousRecorder
+from orchestrator import ModelOrchestrator, Modality
 from main import _run_turn, _listen, pick_input_device
 from interview import TurnResult
 
@@ -26,13 +27,13 @@ class ScriptedInterview:
         self.turns += 1
         emitted = []
         for sentence in self.sentences:
-            if stop():
+            if stop.is_set():
                 break
             emitted.append(sentence)
             emit(sentence)
         text = " ".join(emitted)
         self.history.append({"role": "assistant", "content": text})
-        return TurnResult(say=text, config={}, done=False), stop()
+        return TurnResult(say=text, config={}, done=False), stop.is_set()
 
 
 def main() -> int:

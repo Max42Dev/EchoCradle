@@ -1,22 +1,25 @@
-"""EchoCradle Model Orchestrator.
+"""EchoCradle's synchronous local model hosts and application contracts.
 
-A single local service that turns *content requests* into *finished artifacts*
-without the caller ever blocking. It owns:
+Applications use ``orchestrator.client.ServiceClient.start_owned()`` or
+``ServiceClient.attach()`` for the cached-only local service. Import that module
+explicitly with the optional ``service`` dependencies installed; importing this
+package does not import the client or require its transport/audio dependencies.
 
-* a **catalog** of open-weight models (what exists, what it costs, what it fits),
-* a **probe** of the host machine (VRAM / RAM / disk -> capability tier),
-* a **store** for downloaded weights (one constant location, shared by every
-  experiment and the game),
-* a **planner** that picks the best model for a request on this machine,
-* a **scheduler** that runs tasks by priority and dependency,
-* pluggable **hosts** that actually run a modality (text, speech, ...).
-
-The public entry point is :class:`orchestrator.orchestrator.ModelOrchestrator`.
-
-Design notes live in ``ideas/model-orchestrator/``.
+``ModelOrchestrator`` is the low-level synchronous in-process host facade for
+experiments. Its host calls can block and provision missing assets. The package
+provides catalog, probe, store and planner utilities, not a priority/dependency
+scheduler. Broader proposals live in ``ideas/model-orchestrator/``.
 """
 
 from orchestrator.catalog import Catalog, ModelDescriptor, Modality
+from orchestrator.client_types import (
+        Capabilities,
+        KindCapability,
+        Message,
+        PcmCapability,
+        TextResult,
+        ToolOutcome,
+)
 from orchestrator.conversation import Conversation
 from orchestrator.errors import (
     ModelNotAvailableError,
@@ -34,36 +37,30 @@ from orchestrator.hosts.speech import (
 from orchestrator.orchestrator import ModelOrchestrator
 from orchestrator.probe import ProbeReport, probe
 from orchestrator.store import ModelStore
-from orchestrator.tasks import (
-    Artifact,
-    ContentRequest,
-    Priority,
-    TaskKind,
-    TaskStatus,
-)
 from orchestrator.tools import JsonConfigTool, ToolCall, ToolRegistry, ToolSpec
 
 __all__ = [
-    "Artifact",
     "AudioPlayer",
     "AudioRecorder",
+    "Capabilities",
     "Catalog",
-    "ContentRequest",
     "ContinuousRecorder",
     "Conversation",
     "JsonConfigTool",
+    "KindCapability",
+    "Message",
     "ModelDescriptor",
     "ModelNotAvailableError",
     "ModelOrchestrator",
     "ModelStore",
     "Modality",
     "OrchestratorError",
-    "Priority",
+    "PcmCapability",
     "ProbeReport",
     "TaskFailedError",
-    "TaskKind",
-    "TaskStatus",
+    "TextResult",
     "ToolCall",
+    "ToolOutcome",
     "ToolRegistry",
     "ToolSpec",
     "pick_input_device",

@@ -6,7 +6,8 @@ import argparse
 import time
 from pathlib import Path
 
-from main import AudioPlayer, ModelOrchestrator, Modality
+from main import AudioPlayer
+from orchestrator import ModelOrchestrator, Modality
 
 
 def main() -> int:

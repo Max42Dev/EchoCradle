@@ -298,7 +298,17 @@ class TextHost:
             )
             with closing(stream):
                 try:
-                    yield from stream
+                    acknowledged = False
+                    for chunk in stream:
+                        # Invocation/registry receipt is not model delivery. A
+                        # continuation response is evidence its results reached
+                        # the model endpoint, even if cancellation follows.
+                        if not acknowledged and calls:
+                            delivered = getattr(registry, "results_delivered", None)
+                            if delivered is not None:
+                                delivered(calls)
+                            acknowledged = True
+                        yield chunk
                 except (HostError, OSError, http.client.HTTPException, ValueError):
                     if not stop_requested():
                         raise

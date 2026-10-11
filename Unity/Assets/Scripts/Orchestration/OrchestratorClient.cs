@@ -107,13 +107,22 @@ namespace EchoCradle.Orchestration
 
         internal static async Task<byte[]> ReadBoundedAsync(Stream stream, int limit, CancellationToken token)
         {
+            // Unity/Mono streams can ignore ReadAsync's token. Closing the stream interrupts
+            // the pending native read; cancellation still remains the primary outcome.
+            using (token.Register(() => { try { stream.Dispose(); } catch (Exception) { } }))
             using (var output = new MemoryStream())
             {
                 byte[] buffer = new byte[8192];
                 while (true)
                 {
-                    int count = await stream.ReadAsync(buffer, 0,
-                        Math.Min(buffer.Length, limit + 1 - (int)output.Length), token).ConfigureAwait(false);
+                    int count;
+                    try
+                    {
+                        count = await stream.ReadAsync(buffer, 0,
+                            Math.Min(buffer.Length, limit + 1 - (int)output.Length), token).ConfigureAwait(false);
+                    }
+                    catch (Exception) { token.ThrowIfCancellationRequested(); throw; }
+                    token.ThrowIfCancellationRequested();
                     if (count == 0) return output.ToArray();
                     output.Write(buffer, 0, count);
                     if (output.Length > limit) throw new OrchestratorException("PAYLOAD_LIMIT");
@@ -166,13 +175,20 @@ namespace EchoCradle.Orchestration
                 {
                     using (HttpResponseMessage response = await ResponseAsync(method, path, content,
                         timeout.Token).ConfigureAwait(false))
+                    using (timeout.Token.Register(() => response.Dispose()))
                     using (Stream stream = await response.Content.ReadAsStreamAsync().ConfigureAwait(false))
                     {
                         byte[] bytes = await ReadBoundedAsync(stream, OrchestratorWire.JsonLimit,
                             timeout.Token).ConfigureAwait(false);
-                        // Never include remote error codes/messages: they may echo tokens or prompts.
                         if (!response.IsSuccessStatusCode && !(allowUnready && (int)response.StatusCode == 503))
-                            throw new OrchestratorException("REQUEST_REJECTED");
+                        {
+                            JObject failure;
+                            try { failure = OrchestratorWire.Decode(bytes); }
+                            catch (OrchestratorException)
+                            { throw new OrchestratorException("HTTP_ERROR", (int)response.StatusCode, phase: Phase(path)); }
+                            throw OrchestratorWire.Error(failure["error"] as JObject,
+                                (int)response.StatusCode, Phase(path));
+                        }
                         JObject result = OrchestratorWire.Decode(bytes);
                         if (identity) Identity(result);
                         return result;
@@ -184,8 +200,40 @@ namespace EchoCradle.Orchestration
                     throw new OrchestratorException("TRANSPORT_ERROR");
                 }
                 catch (OrchestratorException) { throw; }
-                catch (Exception) { throw new OrchestratorException("TRANSPORT_ERROR"); }
+                catch (Exception)
+                {
+                    token.ThrowIfCancellationRequested();
+                    throw new OrchestratorException("TRANSPORT_ERROR");
+                }
             }
+        }
+
+        private static string Phase(string path) => path == "/v1/jobs" ? "admission" :
+            path.StartsWith("/v1/artifacts") ? "artifact" : "transport";
+
+        private static bool AdmissionRejected(OrchestratorException error) => error.Phase == "admission" &&
+            (error.HttpStatus >= 400 && error.HttpStatus < 500 || error.HttpStatus == 503 && error.Code == "NOT_READY");
+
+        /// <summary>Advanced admission only; the caller owns polling/cancellation of this job.</summary>
+        public async Task<OrchestratorJob> SubmitAsync(JObject spec, CancellationToken token = default)
+        {
+            if (spec == null) throw new OrchestratorException("INVALID_SPEC");
+            var copy = (JObject)spec.DeepClone();
+            if (copy["idempotency_key"] == null) copy["idempotency_key"] = Guid.NewGuid().ToString("D");
+            using (var linked = CancellationTokenSource.CreateLinkedTokenSource(token, Lifetime))
+            {
+                JObject data = await JsonAsync(HttpMethod.Post, "/v1/jobs", copy, linked.Token, true).ConfigureAwait(false);
+                MatchSpec(data, copy);
+                return new OrchestratorJob(data);
+            }
+        }
+
+        private static void MatchSpec(JObject snapshot, JObject spec)
+        {
+            if (!JToken.DeepEquals(snapshot["session_id"], spec["session_id"] ?? JValue.CreateNull()) ||
+                !JToken.DeepEquals(snapshot["turn_id"], spec["turn_id"] ?? JValue.CreateNull()) ||
+                !JToken.DeepEquals(snapshot["kind"], spec["kind"]))
+                throw new OrchestratorException("PROTOCOL_ERROR");
         }
 
         public async Task<JObject> CapabilitiesAsync(CancellationToken cancellationToken = default)
@@ -216,7 +264,7 @@ namespace EchoCradle.Orchestration
             }
         }
 
-        public Task<string> DialogueAsync(JArray messages, int maxTokens, float temperature, int deadlineMs,
+        public Task<OrchestratorJob> TextAsync(JArray messages, int maxTokens, float temperature, int deadlineMs,
             Action<string> onDelta, CancellationToken cancellationToken = default)
         {
             // Snapshot mutable caller data before handing it to the worker. Do not mutate during this call.
@@ -225,7 +273,7 @@ namespace EchoCradle.Orchestration
             {
                 OrchestratorSession session = _session;
                 if (session == null) throw new OrchestratorException("NO_SESSION");
-                return await session.DialogueAsync(copy, maxTokens, temperature, deadlineMs,
+                return await session.TextAsync(copy, maxTokens, temperature, deadlineMs,
                     onDelta, cancellationToken).ConfigureAwait(false);
             });
         }
@@ -252,10 +300,13 @@ namespace EchoCradle.Orchestration
         }
 
         internal async Task<JObject> RunJobAsync(JObject spec, CancellationToken token,
-            Action<string> submitted = null, Action checkSocket = null)
+            Action<string> submitted = null, Action checkSocket = null, bool returnTerminal = false)
         {
             string id = null;
             bool terminal = false;
+            bool rejected = false;
+            JObject latest = null;
+            var clock = System.Diagnostics.Stopwatch.StartNew();
             int deadlineMs = OrchestratorWire.Integer(spec["deadline_ms"], 1000, 120000);
             if (spec["idempotency_key"] == null) spec["idempotency_key"] = Guid.NewGuid().ToString("D");
             using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(token, Lifetime))
@@ -266,21 +317,23 @@ namespace EchoCradle.Orchestration
                     JObject snapshot = await JsonAsync(HttpMethod.Post, "/v1/jobs", spec,
                         deadline.Token, true).ConfigureAwait(false);
                     id = OrchestratorWire.Id(snapshot["job_id"]);
+                    new OrchestratorJob(snapshot);
+                    latest = snapshot;
                     lock (_sync) _jobs.Add(id);
-                    if (!JToken.DeepEquals(snapshot["session_id"], spec["session_id"] ?? JValue.CreateNull()) ||
-                        !JToken.DeepEquals(snapshot["turn_id"], spec["turn_id"] ?? JValue.CreateNull()) ||
-                        !JToken.DeepEquals(snapshot["kind"], spec["kind"]))
-                        throw new OrchestratorException("PROTOCOL_ERROR");
+                    MatchSpec(snapshot, spec);
                     submitted?.Invoke(id);
                     while (true)
                     {
                         deadline.Token.ThrowIfCancellationRequested();
                         checkSocket?.Invoke();
-                        string state = OrchestratorWire.Text(snapshot["state"], 32);
+                        var job = new OrchestratorJob(snapshot);
+                        string state = job.State;
                         if (state == "succeeded" || state == "failed" || state == "cancelled")
                         {
                             terminal = true;
-                            if (state != "succeeded") throw new OrchestratorException("JOB_FAILED");
+                            if (returnTerminal) return snapshot;
+                            if (state != "succeeded") throw job.Error ?? new OrchestratorException("JOB_FAILED", jobId: id,
+                                phase: "inference", snapshot: job);
                             if (!(snapshot["result"] is JObject result))
                                 throw new OrchestratorException("PROTOCOL_ERROR");
                             return result;
@@ -289,37 +342,73 @@ namespace EchoCradle.Orchestration
                             throw new OrchestratorException("PROTOCOL_ERROR");
                         await Task.Delay(50, deadline.Token).ConfigureAwait(false);
                         snapshot = await SnapshotAsync(id, deadline.Token).ConfigureAwait(false);
+                        MatchSpec(snapshot, spec);
+                        if ((int)snapshot["revision"] < (int)latest["revision"])
+                            throw new OrchestratorException("PROTOCOL_ERROR");
+                        latest = snapshot;
                     }
                 }
                 catch (OperationCanceledException)
                 {
-                    token.ThrowIfCancellationRequested();
-                    Lifetime.ThrowIfCancellationRequested();
-                    throw new OrchestratorException("DEADLINE_EXCEEDED");
-                }
-                finally
-                {
-                    if (!terminal)
+                    int remaining = deadlineMs - (int)clock.ElapsedMilliseconds;
+                    if (id != null && remaining > 0 && !Lifetime.IsCancellationRequested)
                     {
-                        // A cancelled POST can have been admitted. Recover its ID using the SAME
-                        // idempotency key, then cancel. Session deletion is the second safety net.
-                        using (var cleanup = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
+                        // Caller cancellation revokes callbacks immediately; use the remaining total
+                        // job budget to obtain the authoritative cancellation snapshot.
+                        using (var recovery = CancellationTokenSource.CreateLinkedTokenSource(Lifetime))
                         {
-                            if (id == null)
+                            recovery.CancelAfter(Math.Min(1000, remaining));
+                            if (remaining > 0)
                             {
                                 try
                                 {
-                                    JObject recovered = await JsonAsync(HttpMethod.Post, "/v1/jobs", spec,
-                                        cleanup.Token, true).ConfigureAwait(false);
-                                    id = OrchestratorWire.Id(recovered["job_id"]);
+                                    JObject cancelled = await CancelJobAsync(id, recovery.Token).ConfigureAwait(false);
+                                    terminal = true;
+                                    if (returnTerminal) return cancelled;
                                 }
                                 catch (Exception) { }
                             }
-                            if (id != null) await CancelQuietlyAsync(id, cleanup.Token).ConfigureAwait(false);
                         }
+                    }
+                    token.ThrowIfCancellationRequested();
+                    Lifetime.ThrowIfCancellationRequested();
+                    throw new OrchestratorException("DEADLINE_EXCEEDED", jobId: id, phase: "operation",
+                        snapshot: latest == null ? null : new OrchestratorJob(latest));
+                }
+                catch (OrchestratorException error)
+                {
+                    rejected = AdmissionRejected(error);
+                    throw;
+                }
+                finally
+                {
+                    if (!terminal && !rejected)
+                    {
+                        // A cancelled POST can have been admitted. Recover its ID using the SAME
+                        // idempotency key, then cancel. Session deletion is the second safety net.
+                        _ = RecoverAndCancelAsync(id, spec);
                     }
                     if (id != null) lock (_sync) _jobs.Remove(id);
                 }
+            }
+        }
+
+        private async Task RecoverAndCancelAsync(string id, JObject spec)
+        {
+            using (var cleanup = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
+            {
+                try
+                {
+                    if (id == null)
+                    {
+                        JObject recovered = await JsonAsync(HttpMethod.Post, "/v1/jobs", spec,
+                            cleanup.Token, true).ConfigureAwait(false);
+                        new OrchestratorJob(recovered);
+                        id = OrchestratorWire.Id(recovered["job_id"]);
+                    }
+                    await CancelQuietlyAsync(id, cleanup.Token).ConfigureAwait(false);
+                }
+                catch (Exception) { }
             }
         }
 
@@ -329,22 +418,43 @@ namespace EchoCradle.Orchestration
                 token, true).ConfigureAwait(false);
             if (OrchestratorWire.Id(result["job_id"]) != id)
                 throw new OrchestratorException("PROTOCOL_ERROR");
+            new OrchestratorJob(result);
             return result;
+        }
+
+        public async Task<OrchestratorJob> GetJobAsync(string id, CancellationToken token = default)
+        {
+            OrchestratorWire.Id(new JValue(id));
+            using (var linked = CancellationTokenSource.CreateLinkedTokenSource(token, Lifetime))
+                return new OrchestratorJob(await SnapshotAsync(id, linked.Token).ConfigureAwait(false));
+        }
+
+        internal async Task<JObject> CancelJobAsync(string id, CancellationToken token)
+        {
+            OrchestratorWire.Id(new JValue(id));
+            JObject result = await JsonAsync(HttpMethod.Post, "/v1/jobs/" + id + "/cancel", null,
+                token, true).ConfigureAwait(false);
+            var snapshot = new OrchestratorJob(result);
+            if (snapshot.JobId != id || !snapshot.IsTerminal) throw new OrchestratorException("PROTOCOL_ERROR");
+            return result;
+        }
+
+        public async Task<OrchestratorJob> CancelAsync(string id, CancellationToken token = default)
+        {
+            using (var linked = CancellationTokenSource.CreateLinkedTokenSource(token, Lifetime))
+                return new OrchestratorJob(await CancelJobAsync(id, linked.Token).ConfigureAwait(false));
         }
 
         private async Task CancelQuietlyAsync(string id, CancellationToken token)
         {
-            try { await JsonAsync(HttpMethod.Post, "/v1/jobs/" + id + "/cancel", null, token).ConfigureAwait(false); }
+            try { await CancelJobAsync(id, token).ConfigureAwait(false); }
             catch (Exception) { }
         }
 
-        internal async Task DeleteArtifactQuietlyAsync(string id)
+        internal async Task DeleteArtifactQuietlyAsync(string id, CancellationToken token)
         {
-            using (var cleanup = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
-            {
-                try { await JsonAsync(HttpMethod.Delete, "/v1/artifacts/" + id, null, cleanup.Token).ConfigureAwait(false); }
+                try { await JsonAsync(HttpMethod.Delete, "/v1/artifacts/" + id, null, token).ConfigureAwait(false); }
                 catch (Exception) { }
-            }
         }
 
         public async Task<string> TranscribeAsync(byte[] pcm, CancellationToken cancellationToken = default)
@@ -356,6 +466,8 @@ namespace EchoCradle.Orchestration
             {
                 string artifact = null;
                 bool consumed = false;
+                bool definiteRejection = false;
+                linked.CancelAfter(120000);
                 try
                 {
                     JObject upload = await JsonAsync(HttpMethod.Post, "/v1/artifacts", null, linked.Token,
@@ -367,11 +479,16 @@ namespace EchoCradle.Orchestration
                     }, linked.Token, _ => consumed = true).ConfigureAwait(false);
                     return OrchestratorWire.Text(result["text"]);
                 }
+                catch (OrchestratorException error)
+                {
+                    definiteRejection = AdmissionRejected(error);
+                    throw;
+                }
                 finally
                 {
-                    // STT consumes the input on admission; delete only if admission wasn't confirmed.
-                    if (!consumed && artifact != null)
-                        await DeleteArtifactQuietlyAsync(artifact).ConfigureAwait(false);
+                    // Ambiguous POST failures may have consumed/admitted input. Never delete then.
+                    if (!consumed && definiteRejection && artifact != null)
+                        await DeleteArtifactQuietlyAsync(artifact, linked.Token).ConfigureAwait(false);
                 }
             }
         }
@@ -384,6 +501,7 @@ namespace EchoCradle.Orchestration
                     throw new OrchestratorException("INVALID_TTS_TEXT");
                 using (var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, Lifetime))
                 {
+                    linked.CancelAfter(120000); // Total: admission, polling, download, verification and cleanup.
                     JObject result = await RunJobAsync(new JObject
                     {
                         ["kind"] = "tts", ["text"] = text, ["deadline_ms"] = 120000
@@ -401,6 +519,7 @@ namespace EchoCradle.Orchestration
                             download.CancelAfter(TimeSpan.FromSeconds(5));
                             using (HttpResponseMessage response = await ResponseAsync(HttpMethod.Get,
                                 "/v1/artifacts/" + artifact, null, download.Token).ConfigureAwait(false))
+                            using (download.Token.Register(() => response.Dispose()))
                             using (Stream stream = await response.Content.ReadAsStreamAsync().ConfigureAwait(false))
                             {
                                 byte[] bytes = await ReadBoundedAsync(stream, OrchestratorWire.PcmLimit,
@@ -421,8 +540,12 @@ namespace EchoCradle.Orchestration
                     }
                     catch (OperationCanceledException) { throw; }
                     catch (OrchestratorException) { throw; }
-                    catch (Exception) { throw new OrchestratorException("ARTIFACT_INVALID"); }
-                    finally { await DeleteArtifactQuietlyAsync(artifact).ConfigureAwait(false); }
+                    catch (Exception)
+                    {
+                        linked.Token.ThrowIfCancellationRequested();
+                        throw new OrchestratorException("ARTIFACT_INVALID");
+                    }
+                    finally { await DeleteArtifactQuietlyAsync(artifact, linked.Token).ConfigureAwait(false); }
                 }
             });
         }
@@ -458,7 +581,8 @@ namespace EchoCradle.Orchestration
                             lock (_sync) { jobs = new string[_jobs.Count]; _jobs.CopyTo(jobs); }
                             foreach (string id in jobs) await CancelQuietlyAsync(id, cleanup.Token).ConfigureAwait(false);
                             // Wait for an in-flight session creation to finish its own cleanup.
-                            await _sessionGate.WaitAsync().ConfigureAwait(false);
+                            try { await _sessionGate.WaitAsync(cleanup.Token).ConfigureAwait(false); }
+                            catch (OperationCanceledException) { _http.Dispose(); return; }
                             try
                             {
                                 if (_session != null) await _session.CloseAsync(cleanup.Token).ConfigureAwait(false);

@@ -12,6 +12,7 @@
 # Unity IDE files
 *.csproj
 !/tools/ToolDefinitions/*.csproj
+!/tools/InterviewApiProbe/*.csproj
 *.unityproj
 *.sln
 *.suo

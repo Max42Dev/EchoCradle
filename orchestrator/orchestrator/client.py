@@ -20,7 +20,7 @@ import time
 import wave
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -34,19 +34,75 @@ from orchestrator.service_protocol import (
     JSON_LIMIT, PCM_LIMIT, PROTOCOL_VERSION, TERMINAL, TOOL_LIMIT,
     JobSpec, ServiceError, decode, encode, envelope, uuid_string,
 )
-from orchestrator.tools import ToolCall
+from orchestrator.client_types import (
+    Capabilities, Message, TextResult, ToolOutcome, ToolRegistry, freeze_json,
+)
 
 
 class ServiceClientError(OrchestratorError):
-    """Concise transport/protocol failure, with a machine-readable code."""
+    """Sanitized failure metadata; partial results never imply successful completion."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self, code: str, message: str, *, status: int | None = None,
+        retryable: bool = False, job_id: str | None = None, phase: str = "client",
+        partial_result: TextResult | None = None,
+    ) -> None:
         self.code = code
+        self.status = status
+        self.retryable = retryable
+        self.job_id = job_id
+        self.phase = phase
+        self.partial_result = partial_result
         super().__init__(f"{code}: {message}")
 
 
-def _failure(code: str, message: str) -> ServiceClientError:
-    return ServiceClientError(code, message)
+class ServiceCancelledError(ServiceClientError):
+    """Cancellation of a delta iterator/non-text job; carries any known partial result."""
+
+
+def _failure(code: str, message: str, **metadata: Any) -> ServiceClientError:
+    cls = ServiceCancelledError if code == "CANCELLED" else ServiceClientError
+    return cls(code, message, **metadata)
+
+
+def _wire_error(
+    value: Any, *, status: int | None = None, job_id: str | None = None,
+    phase: str = "inference", partial_result: TextResult | None = None,
+) -> ServiceClientError:
+    if not isinstance(value, dict):
+        raise _failure("PROTOCOL_ERROR", "Invalid service error metadata.", phase=phase)
+    code, retryable, correlation = value.get("code"), value.get("retryable"), value.get("job_id")
+    if (not isinstance(code, str) or not code or len(code) > 80
+            or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_" for c in code)
+            or type(retryable) is not bool):
+        raise _failure("PROTOCOL_ERROR", "Invalid service error metadata.", phase=phase)
+    if correlation is not None:
+        correlation = _identifier(correlation)
+        if job_id is not None and correlation != job_id:
+            raise _failure("PROTOCOL_ERROR", "Error job identity mismatch.", phase=phase)
+    return _failure(
+        code, "Service operation did not complete.", status=status, retryable=retryable,
+        job_id=correlation or job_id, phase=phase, partial_result=partial_result,
+    )
+
+
+def _deadline(timeout: float) -> float:
+    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or not 0 < timeout <= 120):
+        raise _failure("INVALID_CONFIG", "Timeout must be in (0, 120] seconds.")
+    return time.monotonic() + timeout
+
+
+def _remaining(deadline: float, phase: str = "transport") -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _failure("DEADLINE_EXCEEDED", "Total operation budget expired.", phase=phase)
+    return remaining
+
+
+def _cancellation(event: threading.Event | None) -> None:
+    if event is not None and not isinstance(event, threading.Event):
+        raise _failure("INVALID_CONFIG", "Cancellation must be a threading.Event.")
 
 
 def _identifier(value: Any) -> str:
@@ -134,13 +190,38 @@ class _TtsProxy:
 
 
 class ServiceClient:
-    """Owned service by default, or attach with ``url`` and bearer ``token``.
+    """Blocking application client. Use ``start_owned`` or ``attach`` explicitly.
 
     Constructor model overrides are service startup policy only. Tool turns use
     the backend's fixed four-round policy. STT uploads at most 30 seconds of
     mono 16 kHz PCM; the streaming capability describes the server's recognizer,
-    not partial network transcripts. Callbacks run synchronously on the caller.
+    not partial network transcripts. Callbacks and tool invocation run only on
+    the caller thread. An Event is safe to set from any thread. Already-running
+    user code cannot be forcibly interrupted: a blocked callback/tool can exceed
+    the budget, but the watcher still cancels remote work. Never block callbacks.
+    Transport waits use a total monotonic budget, not a resetting read timeout.
     """
+
+    @classmethod
+    def start_owned(
+        cls, *, profile: str = "voice", text_model: str | None = None,
+        tts_model: str | None = None, stt_model: str | None = None,
+        speaker_id: int | None = None, shippable_only: bool = False,
+        vad_path: Path | str | None = None,
+    ) -> ServiceClient:
+        """Start a cached-only service; missing deployments fail, never provision."""
+        return cls(
+            profile=profile, text_model=text_model, tts_model=tts_model,
+            stt_model=stt_model, speaker_id=speaker_id,
+            shippable_only=shippable_only, vad_path=vad_path,
+        )
+
+    @classmethod
+    def attach(
+        cls, url: str, *, token: str | None = None, vad_path: Path | str | None = None,
+    ) -> ServiceClient:
+        """Attach without acquiring process ownership or altering service policy."""
+        return cls(url=url, token=token, vad_path=vad_path)
 
     def __init__(
         self,
@@ -314,45 +395,79 @@ class ServiceClient:
     def _response(
         self, method: str, path: str, *, payload: dict[str, Any] | None = None,
         content: bytes | None = None, headers: dict[str, str] | None = None,
-        limit: int = JSON_LIMIT, closing: bool = False,
+        limit: int = JSON_LIMIT, closing: bool = False, deadline: float | None = None,
     ) -> tuple[bytes, httpx.Headers, int]:
         if self._http is None or (self._closing.is_set() and not closing):
             raise _failure("CLIENT_CLOSED", "Service client is closed.")
-        try:
-            if payload is not None:
+        deadline = deadline if deadline is not None else time.monotonic() + 5
+        remaining = _remaining(deadline)
+        if payload is not None:
+            try:
                 content = encode(payload)
                 headers = {**(headers or {}), "Content-Type": "application/json"}
-            with self._http.stream(method, path, content=content, headers=headers) as response:
-                raw = bytearray()
-                for chunk in response.iter_bytes():
-                    raw.extend(chunk)
-                    if len(raw) > limit:
-                        raise _failure("OUTPUT_LIMIT", "Service response exceeds its byte limit.")
-                return bytes(raw), response.headers, response.status_code
-        except ServiceError as exc:
-            raise _failure(exc.code, exc.message) from None
-        except (httpx.HTTPError, RuntimeError, OSError):
-            raise _failure("TRANSPORT_ERROR", "Local service request failed.") from None
+            except ServiceError as exc:
+                raise _failure(exc.code, exc.message, phase="validation") from None
+        http = self._http
+        output: queue.Queue[Any] = queue.Queue(maxsize=1)
+
+        def request() -> None:
+            # Isolate blocking header/body reads. Caller never waits past its total
+            # budget; the transport also receives the remaining inactivity timeout.
+            # A pathological custom transport may retain this daemon until it returns.
+            try:
+                with http.stream(
+                    method, path, content=content, headers=headers,
+                    timeout=httpx.Timeout(min(5, remaining)),
+                ) as response:
+                    raw = bytearray()
+                    for chunk in response.iter_bytes():
+                        _remaining(deadline)
+                        raw.extend(chunk)
+                        if len(raw) > limit:
+                            raise _failure("OUTPUT_LIMIT", "Response exceeds its byte limit.",
+                                           phase="transport")
+                    _remaining(deadline)
+                    output.put((bytes(raw), response.headers, response.status_code))
+            except ServiceClientError as exc:
+                output.put(exc)
+            except Exception:
+                output.put(_failure("TRANSPORT_ERROR", "Local service request failed.",
+                                    phase="transport", retryable=True))
+
+        # Closing requests must also work after the normal thread gate is revoked.
+        worker = threading.Thread(target=request, name="service-http", daemon=True)
+        worker.start()
+        try:
+            result = output.get(timeout=_remaining(deadline))
+        except queue.Empty:
+            raise _failure("DEADLINE_EXCEEDED", "Total transport budget expired.",
+                           phase="transport") from None
+        if isinstance(result, ServiceClientError):
+            raise result
+        return result
 
     def _request(
         self, method: str, path: str, *, payload: dict[str, Any] | None = None,
         content: bytes | None = None, headers: dict[str, str] | None = None,
         identity: bool = False, allow_unready: bool = False, closing: bool = False,
+        deadline: float | None = None,
     ) -> dict[str, Any]:
         raw, _, status = self._response(
             method, path, payload=payload, content=content, headers=headers, closing=closing,
+            deadline=deadline,
         )
         try:
             data = decode(raw)
         except ServiceError:
+            if not 200 <= status < 300:
+                raise _failure("HTTP_ERROR", f"Service HTTP failure ({status}).", status=status,
+                               retryable=status in (429, 502, 503, 504), phase="request") from None
             raise _failure("PROTOCOL_ERROR", "Invalid JSON service response.") from None
         if not 200 <= status < 300 and not (allow_unready and status == 503):
-            error = data.get("error")
-            code = error.get("code") if isinstance(error, dict) else None
-            if not isinstance(code, str) or len(code) > 80:
-                code = "REQUEST_FAILED"
-            # Never surface arbitrary server/transport text containing secrets or prompts.
-            raise _failure(code, f"Service rejected the request (HTTP {status}).")
+            if "error" not in data:
+                raise _failure("HTTP_ERROR", f"Service HTTP failure ({status}).", status=status,
+                               retryable=status in (429, 502, 503, 504), phase="request")
+            raise _wire_error(data["error"], status=status, phase="request")
         if identity:
             self._check_identity(data)
         return data
@@ -365,6 +480,7 @@ class ServiceClient:
             try:
                 health = self._request(
                     "GET", "/v1/health/ready", identity=True, allow_unready=True,
+                    deadline=deadline,
                 )
             except ServiceClientError as exc:
                 if exc.code != "TRANSPORT_ERROR":
@@ -382,7 +498,7 @@ class ServiceClient:
                 raise _failure("CLIENT_CLOSED", "Startup cancelled.")
         raise _failure("STARTUP_TIMEOUT", "Service readiness exceeded 120 seconds.")
 
-    def capabilities(self) -> dict[str, Any]:
+    def capabilities(self) -> Capabilities:
         data = self._request("GET", "/v1/capabilities", identity=True)
         probe = data.get("probe")
         kinds = data.get("kinds")
@@ -390,6 +506,23 @@ class ServiceClient:
             raise _failure("PROTOCOL_ERROR", "Service capabilities are incomplete.")
         report = dict(probe)
         gpus = report.get("gpus", [])
+        if (not isinstance(gpus, list) or any(
+            not isinstance(gpu, dict) or not isinstance(gpu.get("total_gb"), (int, float))
+            or isinstance(gpu.get("total_gb"), bool) or not 0 <= gpu["total_gb"] <= 1_000_000
+            for gpu in gpus
+        )):
+            raise _failure("PROTOCOL_ERROR", "Invalid GPU capabilities.")
+        for kind in kinds.values():
+            if not isinstance(kind, dict) or kind.get("state") not in (
+                "ready", "warming", "unsupported", "unprovisioned", "unavailable",
+            ):
+                raise _failure("PROTOCOL_ERROR", "Invalid modality capabilities.")
+        tts, stt = kinds.get("tts", {}), kinds.get("stt", {})
+        if (type(tts.get("sample_rate", 0)) is not int
+                or not 0 <= tts.get("sample_rate", 0) <= 192000
+                or type(tts.get("speaker_id", 0)) is not int
+                or type(stt.get("partials", False)) is not bool):
+            raise _failure("PROTOCOL_ERROR", "Invalid speech capabilities.")
         report["gpus"] = [SimpleNamespace(**gpu) for gpu in gpus]
         report["total_vram_gb"] = sum(gpu.total_gb for gpu in report["gpus"])
         report["has_gpu"] = bool(gpus)
@@ -397,15 +530,18 @@ class ServiceClient:
         self.stt.is_streaming = bool(kinds.get("stt", {}).get("partials", False))
         self.tts.sample_rate = int(kinds.get("tts", {}).get("sample_rate", 0))
         self.tts.speaker_id = int(kinds.get("tts", {}).get("speaker_id", 0))
-        return data
+        return cast(Capabilities, data)
 
-    def _submit(self, spec: dict[str, Any]) -> dict[str, Any]:
+    def _submit(
+        self, spec: dict[str, Any], *, deadline: float | None = None,
+    ) -> dict[str, Any]:
         spec = {"deadline_ms": 120_000, "idempotency_key": str(uuid4()), **spec}
         try:
             JobSpec.parse(spec)
         except ServiceError as exc:
-            raise _failure(exc.code, exc.message) from None
-        data = self._request("POST", "/v1/jobs", payload=spec, identity=True)
+            raise _failure(exc.code, exc.message, phase="validation") from None
+        data = self._request("POST", "/v1/jobs", payload=spec, identity=True, deadline=deadline)
+        self._validate_snapshot(data)
         identifier = _identifier(data.get("job_id"))
         if data.get("session_id") != spec.get("session_id") or (
             data.get("turn_id") != spec.get("turn_id") or data.get("kind") != spec["kind"]
@@ -423,63 +559,176 @@ class ServiceClient:
             raise _failure("CLIENT_CLOSED", "Service client closed during job submission.")
         return data
 
-    def _snapshot(self, identifier: str, *, closing: bool = False) -> dict[str, Any]:
-        data = self._request("GET", f"/v1/jobs/{identifier}", identity=True, closing=closing)
+    def _snapshot(
+        self, identifier: str, *, closing: bool = False, deadline: float | None = None,
+    ) -> dict[str, Any]:
+        data = self._request("GET", f"/v1/jobs/{identifier}", identity=True, closing=closing,
+                             deadline=deadline)
+        self._validate_snapshot(data)
         if data.get("job_id") != identifier:
             raise _failure("PROTOCOL_ERROR", "Job snapshot identity mismatch.")
         return data
 
-    def _cancel(self, identifier: str, *, closing: bool = False) -> dict[str, Any]:
-        # Cancel responses omit instance identity; confirm it with the subsequent read.
-        self._request("POST", f"/v1/jobs/{identifier}/cancel", closing=closing)
-        return self._snapshot(identifier, closing=closing)
+    def _cancel(
+        self, identifier: str, *, closing: bool = False, deadline: float | None = None,
+    ) -> dict[str, Any]:
+        data = self._request("POST", f"/v1/jobs/{identifier}/cancel", closing=closing,
+                             identity=True, deadline=deadline)
+        self._validate_snapshot(data)
+        if data.get("job_id") != identifier:
+            raise _failure("PROTOCOL_ERROR", "Cancel snapshot identity mismatch.")
+        return data
+
+    def _cleanup_cancel(self, identifier: str, deadline: float) -> None:
+        """Cleanup cannot extend a failed operation or replace its primary error."""
+        def cancel() -> None:
+            try:
+                self._cancel(identifier, closing=True, deadline=time.monotonic() + 0.2)
+            except OrchestratorError:
+                pass
+
+        if time.monotonic() >= deadline:
+            threading.Thread(target=cancel, name="service-cancel-cleanup", daemon=True).start()
+        else:
+            try:
+                self._cancel(identifier, closing=True,
+                             deadline=min(deadline, time.monotonic() + 0.2))
+            except OrchestratorError:
+                pass
+
+    @staticmethod
+    def _validate_snapshot(data: dict[str, Any]) -> None:
+        if (type(data.get("v")) is not int or data["v"] != PROTOCOL_VERSION
+                or data.get("state") not in
+                ("queued", "running", "waiting_tool", "succeeded", "failed", "cancelled")
+                or type(data.get("revision")) is not int or data["revision"] < 0
+                or type(data.get("host_pending")) is not bool):
+            raise _failure("PROTOCOL_ERROR", "Invalid canonical job snapshot.")
 
     @staticmethod
     def _result(snapshot: dict[str, Any]) -> dict[str, Any]:
         if snapshot.get("state") != "succeeded":
-            error = snapshot.get("error") or {}
-            code = error.get("code", "JOB_FAILED") if isinstance(error, dict) else "JOB_FAILED"
-            raise _failure(str(code)[:80], "Remote inference did not complete.")
+            raise _wire_error(snapshot.get("error"), job_id=snapshot.get("job_id"))
         result = snapshot.get("result")
         if not isinstance(result, dict):
             raise _failure("PROTOCOL_ERROR", "Missing job result.")
         return result
 
-    def _poll(self, job: dict[str, Any], *, deadline: float | None = None) -> dict[str, Any]:
+    def _poll(
+        self, job: dict[str, Any], *, deadline: float | None = None,
+        cancellation: threading.Event | None = None, snapshot: bool = False,
+    ) -> dict[str, Any]:
         identifier = job["job_id"]
         deadline = deadline if deadline is not None else time.monotonic() + 120
         try:
             while True:
                 if job.get("state") in TERMINAL:
-                    return self._result(job)
+                    return job if snapshot else self._result(job)
+                if cancellation is not None and cancellation.is_set():
+                    job = self._cancel(identifier, deadline=deadline)
+                    continue
                 if self._closing.is_set():
                     raise _failure("CLIENT_CLOSED", "Remote inference cancelled.")
                 if time.monotonic() >= deadline:
-                    self._cancel(identifier)
-                    raise _failure("DEADLINE_EXCEEDED", "Remote job exceeded 120 seconds.")
-                self._closing.wait(0.05)
-                job = self._snapshot(identifier)
+                    raise _failure("DEADLINE_EXCEEDED", "Total job budget expired.",
+                                   job_id=identifier, phase="inference")
+                self._closing.wait(min(0.05, _remaining(deadline)))
+                job = self._snapshot(identifier, deadline=deadline)
         except BaseException:
             if job.get("state") not in TERMINAL:
-                try:
-                    self._cancel(identifier, closing=True)
-                except OrchestratorError:
-                    pass
+                self._cleanup_cancel(identifier, deadline)
             raise
         finally:
             with self._lock:
                 self._jobs.discard(identifier)
 
     def chat(
-        self, messages: list[dict[str, str]], *, max_tokens: int = 512,
+        self, messages: list[Message], *, max_tokens: int = 512,
         temperature: float = 0.7, json_schema: dict[str, Any] | None = None,
-    ) -> str:
-        result = self._poll(self._submit({
+        cancellation: threading.Event | None = None, timeout: float = 120,
+    ) -> TextResult:
+        _cancellation(cancellation)
+        deadline = _deadline(timeout)
+        job = self._submit({
             "kind": "text", "messages": messages,
             "max_tokens": max_tokens, "temperature": temperature,
             "json_schema": json_schema,
-        }))
-        return self._text(result)
+        }, deadline=deadline)
+        try:
+            final = self._poll(job, deadline=deadline, cancellation=cancellation, snapshot=True)
+            return self._text_result(final)
+        except ServiceClientError as exc:
+            exc.job_id = exc.job_id or job["job_id"]
+            exc.partial_result = exc.partial_result or self._text_result(job, allow_active=True)
+            raise
+
+    @staticmethod
+    def _text_result(
+        snapshot: dict[str, Any], *, text: str = "", local: tuple[ToolOutcome, ...] = (),
+        allow_active: bool = False,
+    ) -> TextResult:
+        identifier = _identifier(snapshot.get("job_id"))
+        turn = snapshot.get("turn_id")
+        if turn is not None:
+            turn = _identifier(turn)
+        state = snapshot.get("state")
+        if state not in TERMINAL:
+            if not allow_active:
+                raise _failure("PROTOCOL_ERROR", "Nonterminal text result.")
+            state = "failed"  # Local failure, not a fabricated remote success/cancellation.
+        result = snapshot.get("result")
+        calls: list[ToolOutcome] = []
+        executed = {call.dispatch_id: call for call in local}
+        seen: set[str] = set()
+        if result is not None:
+            if not isinstance(result, dict) or not isinstance(result.get("text"), str):
+                raise _failure("PROTOCOL_ERROR", "Invalid text result.")
+            text = result["text"]
+            records = result.get("calls")
+            if not isinstance(records, list):
+                raise _failure("PROTOCOL_ERROR", "Invalid tool outcomes.")
+            for record in records:
+                if not isinstance(record, dict):
+                    raise _failure("PROTOCOL_ERROR", "Invalid tool outcome.")
+                model_id, dispatch = record.get("id"), record.get("dispatch_id")
+                if model_id is not None and (not isinstance(model_id, str) or not model_id):
+                    raise _failure("PROTOCOL_ERROR", "Invalid model call identifier.")
+                if dispatch is not None:
+                    dispatch = _identifier(dispatch)
+                    if dispatch in seen:
+                        raise _failure("PROTOCOL_ERROR", "Duplicate dispatch outcome.")
+                    seen.add(dispatch)
+                outcome, delivered = record.get("outcome"), record.get("result_delivered")
+                if (outcome not in ("rejected", "completed", "unknown")
+                        or type(delivered) is not bool
+                    or (delivered and outcome == "unknown")
+                        or not isinstance(record.get("name"), str)
+                        or not isinstance(record.get("arguments"), dict)
+                        or "result" not in record):
+                    raise _failure("PROTOCOL_ERROR", "Invalid tool outcome facts.")
+                evidence = executed.get(dispatch)
+                if evidence is not None and (
+                    evidence.name != record["name"]
+                    or evidence.arguments != freeze_json(record["arguments"])
+                ):
+                    raise _failure("PROTOCOL_ERROR", "Tool execution identity mismatch.")
+                try:
+                    encode(record["arguments"], TOOL_LIMIT)
+                    encode(record["result"], TOOL_LIMIT)
+                except ServiceError:
+                    raise _failure("PROTOCOL_ERROR", "Invalid tool outcome JSON.") from None
+                calls.append(ToolOutcome(
+                    model_id, dispatch, record["name"], record["arguments"],
+                    evidence.result if evidence and outcome == "unknown" else record["result"],
+                    outcome, delivered, evidence is not None,
+                ))
+        elif state == "succeeded":
+            raise _failure("PROTOCOL_ERROR", "Missing successful text result.")
+        calls.extend(call for call in local if call.dispatch_id not in seen)
+        partial = TextResult(state, text, identifier, turn, tuple(calls))
+        if state == "failed" and not allow_active:
+            raise _wire_error(snapshot.get("error"), job_id=identifier, partial_result=partial)
+        return partial
 
     @staticmethod
     def _text(result: dict[str, Any]) -> str:
@@ -489,72 +738,85 @@ class ServiceClient:
         return text
 
     def chat_with_tools(
-        self, messages: list[dict[str, str]], registry: Any, *, max_tokens: int = 512,
+        self, messages: list[Message], registry: ToolRegistry, *, max_tokens: int = 512,
         temperature: float = 0.7, max_rounds: int = 4,
-    ) -> tuple[str, list[ToolCall]]:
+        cancellation: threading.Event | None = None, timeout: float = 120,
+    ) -> TextResult:
         return self.stream_chat_with_tools(
             messages, registry, max_tokens=max_tokens,
             temperature=temperature, max_rounds=max_rounds,
+            cancellation=cancellation, timeout=timeout,
         )
 
     def stream_chat(
-        self, messages: list[dict[str, str]], *, max_tokens: int = 512,
+        self, messages: list[Message], *, max_tokens: int = 512,
         temperature: float = 0.7, json_schema: dict[str, Any] | None = None,
         on_text: Callable[[str], None] | None = None,
-        should_stop: Callable[[], bool] | None = None,
-    ) -> str:
-        """Stream text or constrained JSON over a cancellable service session.
-
-        Callbacks must only hand off work; never wait for TTS or playback here.
-        A cancelled call returns partial text, which must not be used as actions.
-        """
+        cancellation: threading.Event | None = None, timeout: float = 120,
+    ) -> TextResult:
+        """Deliver deltas via caller-thread callback, return explicit final outcome."""
+        _cancellation(cancellation)
+        deadline = _deadline(timeout)
         session = self._request("POST", "/v1/sessions", payload={
-            "tools": [], "delivery_mode": "text",
-        }, identity=True)
+            "tools": [],
+        }, identity=True, deadline=deadline)
         session_id = _identifier(session.get("session_id"))
-        turn = _Turn(self, session_id, str(uuid4()), None, [], on_text, should_stop)
+        turn = _Turn(self, session_id, str(uuid4()), None, [], on_text, cancellation, deadline)
         try:
-            text, _ = turn.run(messages, max_tokens, temperature, json_schema=json_schema,
-                               kind="text")
-            return text
+            return turn.run(messages, max_tokens, temperature, json_schema=json_schema)
+        except ServiceClientError as exc:
+            turn.enrich_error(exc)
+            raise
         finally:
             turn.close()
             try:
-                self._request("DELETE", f"/v1/sessions/{session_id}", closing=True)
+                self._request("DELETE", f"/v1/sessions/{session_id}", closing=True,
+                              deadline=deadline)
             except OrchestratorError:
                 pass
 
-    def _tool_names(self, registry: Any) -> list[str]:
+    def _tool_declarations(self, registry: ToolRegistry) -> list[dict[str, Any]]:
         from orchestrator.service_protocol import session_spec
 
-        declarations = registry.specs()
+        try:
+            declarations = registry.specs()
+        except Exception:
+            raise _failure("CALLBACK_FAILED", "Tool declarations callback failed.",
+                           phase="callback") from None
         try:
             session_spec({"tools": declarations})
         except ServiceError as exc:
             raise _failure(exc.code, exc.message) from None
-        return [tool["function"]["name"] for tool in declarations]
+        return declarations
 
     def stream_chat_with_tools(
-        self, messages: list[dict[str, str]], registry: Any, *, max_tokens: int = 512,
+        self, messages: list[Message], registry: ToolRegistry, *, max_tokens: int = 512,
         temperature: float = 0.7, max_rounds: int = 4,
         on_text: Callable[[str], None] | None = None,
-        should_stop: Callable[[], bool] | None = None,
-    ) -> tuple[str, list[ToolCall]]:
+        cancellation: threading.Event | None = None, timeout: float = 120,
+    ) -> TextResult:
+        _cancellation(cancellation)
         if max_rounds != 4:
             raise _failure("UNSUPPORTED_OPTION", "Service fixes tool turns at four rounds.")
-        names = self._tool_names(registry)
+        deadline = _deadline(timeout)
+        declarations = self._tool_declarations(registry)
+        names = [tool["function"]["name"] for tool in declarations]
         session = self._request("POST", "/v1/sessions", payload={
-            "tools": registry.specs(), "delivery_mode": "text",
-        }, identity=True)
+            "tools": declarations,
+        }, identity=True, deadline=deadline)
         session_id = _identifier(session.get("session_id"))
         turn_id = str(uuid4())
-        turn = _Turn(self, session_id, turn_id, registry, names, on_text, should_stop)
+        turn = _Turn(self, session_id, turn_id, registry, names, on_text, cancellation, deadline)
         try:
             return turn.run(messages, max_tokens, temperature)
+        except ServiceClientError as exc:
+            turn.enrich_error(exc)
+            raise
         finally:
             turn.close()
             try:
-                self._request("DELETE", f"/v1/sessions/{session_id}", closing=True)
+                self._request("DELETE", f"/v1/sessions/{session_id}", closing=True,
+                              deadline=deadline)
             except OrchestratorError:
                 pass
 
@@ -579,25 +841,30 @@ class ServiceClient:
         for chunk in chunks:
             if time.monotonic() >= deadline:
                 raise _failure("DEADLINE_EXCEEDED", "Combined TTS exceeded 120 seconds.")
-            result = self._poll(self._submit({"kind": "tts", "text": chunk}), deadline=deadline)
+            result = self._poll(
+                self._submit({"kind": "tts", "text": chunk}, deadline=deadline), deadline=deadline,
+            )
             rate, count = result.get("sample_rate"), result.get("sample_count")
             if (type(rate) is not int or not 1 <= rate <= 192000
                     or type(count) is not int or not 0 <= count <= rate * 20
                     or (sample_rate and sample_rate != rate)):
                 raise _failure("PROTOCOL_ERROR", "Invalid TTS artifact format.")
             identifier = _identifier(result.get("artifact_id"))
-            self._request("GET", "/v1/health/live", identity=True)
+            self._request("GET", "/v1/health/live", identity=True, deadline=deadline)
             raw, headers, status = self._response(
-                "GET", f"/v1/artifacts/{identifier}", limit=rate * 20 * 2,
+                "GET", f"/v1/artifacts/{identifier}", limit=rate * 20 * 2, deadline=deadline,
             )
-            self._request("GET", "/v1/health/live", identity=True)
+            self._request("GET", "/v1/health/live", identity=True, deadline=deadline)
             digest = hashlib.sha256(raw).hexdigest()
             if (status != 200 or len(raw) != count * 2 or digest != result.get("sha256")
                     or headers.get("x-content-sha256") != digest
                     or headers.get("x-sample-rate") != str(rate)
                     or headers.get("x-sample-count") != str(count)):
                 raise _failure("ARTIFACT_INVALID", "TTS artifact integrity check failed.")
-            self._request("DELETE", f"/v1/artifacts/{identifier}")
+            try:
+                self._request("DELETE", f"/v1/artifacts/{identifier}", deadline=deadline)
+            except OrchestratorError:
+                pass  # Verified audio remains usable; retention TTL owns failed cleanup.
             sample_rate = rate
             total_samples += count
             if total_samples > rate * 120:
@@ -617,13 +884,30 @@ class ServiceClient:
                 or not np.isfinite(audio).all()):
             raise _failure("INVALID_PCM", "Expected at most 30 seconds of finite mono PCM.")
         pcm = np.rint(np.clip(audio, -1, 1) * 32767).astype("<i2").tobytes()
+        deadline = time.monotonic() + 120
         artifact = self._request(
             "POST", "/v1/artifacts", content=pcm,
             headers={"Content-Type": "application/octet-stream", "X-Sample-Rate": "16000"},
+            deadline=deadline,
         )
-        result = self._poll(self._submit({
-            "kind": "stt", "input_artifact_id": _identifier(artifact.get("artifact_id")),
-        }))
+        identifier = _identifier(artifact.get("artifact_id"))
+        try:
+            job = self._submit({"kind": "stt", "input_artifact_id": identifier},
+                               deadline=deadline)
+        except ServiceClientError as exc:
+            # Only a validated admission rejection proves no server owns the PCM.
+                # NOT_READY is also a definite pre-admission rejection. Other 5xx,
+                # transport/protocol failures may have accepted it: let TTL reclaim.
+            if (exc.phase == "validation" or (exc.phase == "request"
+                    and exc.code not in ("HTTP_ERROR", "PROTOCOL_ERROR")
+                    and exc.status is not None and (400 <= exc.status < 500
+                    or (exc.status == 503 and exc.code == "NOT_READY")))):
+                try:
+                    self._request("DELETE", f"/v1/artifacts/{identifier}", deadline=deadline)
+                except OrchestratorError:
+                    pass
+            raise
+        result = self._poll(job, deadline=deadline)
         return self._text(result)
 
     def transcribe(self, wav_path: Path | str, *, on_partial: Any = None) -> str:
@@ -760,12 +1044,13 @@ class _Turn:
     """Independent socket reader/heartbeat/cancellation; caller consumes tools."""
 
     def __init__(
-        self, client: ServiceClient, session: str, turn: str, registry: Any,
-        names: list[str], on_text: Any, should_stop: Any,
+        self, client: ServiceClient, session: str, turn: str, registry: ToolRegistry | None,
+        names: list[str], on_text: Callable[[str], None] | None,
+        cancellation: threading.Event | None, deadline: float,
     ) -> None:
         self.client, self.session, self.turn = client, session, turn
         self.registry, self.names = registry, names
-        self.on_text, self.should_stop = on_text, should_stop
+        self.on_text, self.cancellation = on_text, cancellation
         self.socket: Any = None
         self.queue: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue(maxsize=64)
         self.lock = threading.RLock()
@@ -778,12 +1063,35 @@ class _Turn:
         self.terminal: dict[str, Any] | None = None
         self.error: ServiceClientError | None = None
         self.sequence = 1
-        self.deadline = time.monotonic() + 120
+        self.deadline = deadline
         self.pending: dict[str, float] = {}
         self.seen: set[str] = set()
         self.threads: list[threading.Thread] = []
         self.text: list[str] = []
-        self.calls: list[ToolCall] = []
+        self.calls: list[ToolOutcome] = []
+
+    def enrich_error(self, error: ServiceClientError) -> None:
+        error.job_id = error.job_id or self.job
+        if self.job is not None and self.terminal is None:
+            try:
+                self._accept_terminal(self.client._snapshot(
+                    self.job, closing=True,
+                    deadline=min(self.deadline, time.monotonic() + 0.2),
+                ))
+            except OrchestratorError:
+                pass
+        if self.job is not None and error.partial_result is None:
+            try:
+                error.partial_result = self.client._text_result(
+                    self.terminal or {
+                        "job_id": self.job, "turn_id": self.turn, "state": "failed",
+                    }, text="".join(self.text), local=tuple(self.calls), allow_active=True,
+                )
+            except OrchestratorError:
+                # Invalid remote evidence must not replace the primary failure.
+                error.partial_result = TextResult(
+                    "failed", "".join(self.text), self.job, self.turn, tuple(self.calls),
+                )
 
     def send(self, event: str, payload: dict[str, Any], *, job: bool = False) -> None:
         with self.send_lock:
@@ -859,6 +1167,8 @@ class _Turn:
                             or payload.get("turn_id") != self.turn
                             or payload.get("session_id") != self.session):
                         raise _failure("PROTOCOL_ERROR", "Socket snapshot identity mismatch.")
+                    self.client._check_identity(payload)
+                    self.client._validate_snapshot(payload)
                     self._accept_terminal(payload)
                     continue
                 if event in ("text.end", "error"):
@@ -906,7 +1216,7 @@ class _Turn:
         while not self.done.wait(0.02):
             try:
                 stopped = self.client._closing.is_set() or (
-                    self.should_stop is not None and self.should_stop()
+                    self.cancellation is not None and self.cancellation.is_set()
                 )
                 expired = time.monotonic() >= self.deadline
                 if not (stopped or expired or self.error is not None):
@@ -917,16 +1227,21 @@ class _Turn:
                 if not self.job_ready.wait(0.02):
                     continue
                 assert self.job is not None
-                snapshot = self.client._cancel(self.job, closing=True)
-                self._accept_terminal(snapshot)
                 if expired:
-                    self.fail(_failure("DEADLINE_EXCEEDED", "Remote turn exceeded 120 seconds."))
+                    self.fail(_failure("DEADLINE_EXCEEDED", "Total turn budget expired.",
+                                       job_id=self.job, phase="inference"))
+                    self.client._cleanup_cancel(self.job, self.deadline)
+                    return
+                snapshot = self.client._cancel(
+                    self.job, closing=True, deadline=self.deadline,
+                )
+                self._accept_terminal(snapshot)
                 return
             except ServiceClientError as exc:
                 self.fail(exc)
                 return
             except Exception:
-                self.fail(_failure("CALLBACK_FAILED", "Cancellation callback failed."))
+                self.fail(_failure("TRANSPORT_ERROR", "Cancellation request failed."))
                 return
 
     def _invoke(self, payload: dict[str, Any]) -> None:
@@ -937,7 +1252,8 @@ class _Turn:
                 return
         # Read the authoritative job immediately before mutating client state.
         assert self.job is not None
-        snapshot = self.client._snapshot(self.job)
+        snapshot = self.client._snapshot(self.job, deadline=self.deadline)
+        self._accept_terminal(snapshot)
         if snapshot.get("state") != "waiting_tool":
             with self.lock:
                 self.pending.pop(identifier, None)
@@ -946,37 +1262,49 @@ class _Turn:
             if (self.revoked.is_set() or time.monotonic() >= expires
                     or identifier not in self.pending):
                 return
-        if self.should_stop is not None and self.should_stop():
+        if self.cancellation is not None and self.cancellation.is_set():
             self.revoked.set()
             return
-        call = ToolCall(identifier, payload["name"], payload["arguments"])
-        # Registry.invoke (experiment authority) runs on the consumer, never reader.
-        call.result = self.registry.invoke(call.name, call.arguments)
+        # Record execution evidence even if invocation raises after a side effect.
+        # No model ID exists in tool.call. A socket send proves no model delivery.
+        assert self.registry is not None
+        arguments = freeze_json(payload["arguments"])
+        call = ToolOutcome(None, identifier, payload["name"], arguments, None,
+                           "unknown", False, True)
         self.calls.append(call)
         try:
-            encode(call.result, TOOL_LIMIT)
+            result = self.registry.invoke(payload["name"], dict(payload["arguments"]))
+        except Exception:
+            raise _failure("CALLBACK_FAILED", "Tool invocation failed.", phase="callback") from None
+        try:
+            encode(result, TOOL_LIMIT)
         except ServiceError:
             raise _failure("OUTPUT_LIMIT", "Client tool result exceeds its JSON limit.") from None
+        self.calls[-1] = ToolOutcome(None, identifier, call.name, arguments, result,
+                                     "unknown", False, True)
         with self.lock:
             if (self.revoked.is_set() or time.monotonic() >= expires
+                or (self.cancellation is not None and self.cancellation.is_set())
                     or identifier not in self.pending or self.terminal is not None):
                 return
             self.pending.pop(identifier)
-            self.send("tool.result", {"call_id": identifier, "result": call.result}, job=True)
+            self.send("tool.result", {"call_id": identifier, "result": result}, job=True)
 
     def run(
-        self, messages: list[dict[str, str]], max_tokens: int, temperature: float,
-        *, json_schema: dict[str, Any] | None = None, kind: str = "dialogue",
-    ) -> tuple[str, list[ToolCall]]:
+        self, messages: list[Message], max_tokens: int, temperature: float,
+        *, json_schema: dict[str, Any] | None = None,
+    ) -> TextResult:
         url = self.client._url
         socket_url = ("wss" if url.startswith("https:") else "ws") + url[url.index(":"):]
         try:
             self.socket = connect(
                 f"{socket_url}/v1/sessions/{self.session}/events",
                 additional_headers={"Authorization": f"Bearer {self.client._token}"},
-                open_timeout=5, close_timeout=1, max_size=JSON_LIMIT,
+                open_timeout=min(5, _remaining(self.deadline)), close_timeout=1, max_size=JSON_LIMIT,
                 max_queue=16, compression=None, proxy=None,
             )
+        except ServiceClientError:
+            raise
         except Exception:
             raise _failure("SOCKET_LOST", "Cannot connect service session socket.") from None
         with self.client._lock:
@@ -985,19 +1313,19 @@ class _Turn:
             self.client._sockets.add(self.socket)
         self.threads.append(self.client._thread(self.receive, "service-events"))
         self.send("hello", {})
-        if not self.hello.wait(5):
+        if not self.hello.wait(min(5, _remaining(self.deadline))):
             raise _failure("SOCKET_LOST", "Socket negotiation timed out.")
         if self.error is not None:
             raise self.error
         self.threads.append(self.client._thread(self.heartbeat, "service-heartbeat"))
         self.threads.append(self.client._thread(self.watch_cancel, "service-cancel"))
         submitted = self.client._submit({
-            "kind": kind, "session_id": self.session, "turn_id": self.turn,
+            "kind": "text", "session_id": self.session, "turn_id": self.turn,
             "messages": messages, "max_tokens": max_tokens,
             "temperature": temperature, "streaming": True,
             "json_schema": json_schema,
             "idempotency_key": self.turn,
-        })
+        }, deadline=self.deadline)
         with self.lock:
             if self.job is not None and self.job != submitted["job_id"]:
                 raise _failure("PROTOCOL_ERROR", "Submitted turn job changed.")
@@ -1009,14 +1337,10 @@ class _Turn:
             with self.lock:
                 terminal = self.terminal
             if terminal is not None and (self.revoked.is_set() or self.queue.empty()):
-                if terminal.get("state") == "cancelled":
-                    return "".join(self.text), self.calls
-                result = self.client._result(terminal)
-                if self.revoked.is_set():
-                    return "".join(self.text), self.calls
-                return self.client._text(result), self.calls
-            if time.monotonic() >= self.deadline + 10:
-                raise _failure("DEADLINE_EXCEEDED", "Cancelled turn snapshot timed out.")
+                return self.client._text_result(
+                    terminal, text="".join(self.text), local=tuple(self.calls),
+                )
+            _remaining(self.deadline, "inference")
             try:
                 event, payload = self.queue.get(timeout=0.05)
             except queue.Empty:
@@ -1032,24 +1356,30 @@ class _Turn:
                     try:
                         self.on_text(text)
                     except Exception:
-                        raise _failure("CALLBACK_FAILED", "Text callback failed.") from None
+                        raise _failure("CALLBACK_FAILED", "Text callback failed.",
+                                       phase="callback") from None
 
     def close(self) -> None:
         self.revoked.set()
         if self.job_ready.is_set() and self.job is not None and self.terminal is None:
-            try:
-                self._accept_terminal(self.client._cancel(self.job, closing=True))
-            except OrchestratorError:
-                pass
+            self.client._cleanup_cancel(self.job, self.deadline)
         self.done.set()
         if self.socket is not None:
-            try:
-                self.socket.close()
-            except Exception:
-                pass
+            closed = threading.Event()
+
+            def close_socket() -> None:
+                try:
+                    self.socket.close()
+                except Exception:
+                    pass
+                finally:
+                    closed.set()
+
+            threading.Thread(target=close_socket, name="service-socket-close", daemon=True).start()
+            closed.wait(max(0, min(1, self.deadline - time.monotonic())))
             with self.client._lock:
                 self.client._sockets.discard(self.socket)
-        deadline = time.monotonic() + 6
+        deadline = min(self.deadline, time.monotonic() + 1)
         for thread in self.threads:
             if thread is not threading.current_thread():
                 thread.join(timeout=max(0, deadline - time.monotonic()))

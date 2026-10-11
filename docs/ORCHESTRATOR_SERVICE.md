@@ -1,9 +1,10 @@
 # ModelOrchestrator service for Unity
 
 **Status: DESIGN REFERENCE — bounded first slice implemented; full design not implemented.**  
-**Date:** 2026-10-06  
+**Baseline updated:** 2026-10-10 (proposal retained from 2026-10-06)
 **Scope:** target architecture for a separate local Python process and future
-Unity client. The implementation status below is current as of **2026-10-06**;
+full Unity voice transport. The bounded Unity client already exists. The
+implementation status below is current as of **2026-10-10**;
 sections 2–10 describe the broader proposed contract, not the shipped API.
 For actual commands, wire fields and limitations, use
 [`SERVICE_USAGE.md`](SERVICE_USAGE.md).
@@ -16,20 +17,23 @@ Unity consumes one long-lived ModelOrchestrator service bound to
 These dependencies are declared in the package's `service` and `all` extras.
 The intended full service owns catalog, provisioning, scheduling and hosts;
 provisioning and joint resource scheduling are not implemented. Unity is intended
-to own devices, gameplay, saves and delivery evidence; no Unity client exists yet.
+to own devices, gameplay, saves and delivery evidence; the shipped Unity
+interview prototype does so using the bounded REST/JSON transport.
 
-REST handles health, capabilities, sessions, jobs and provisioning. A single
+In the **proposed full design**, REST handles health, capabilities, sessions,
+jobs and provisioning. A single
 authenticated WebSocket per session carries ordered, full-duplex text, PCM,
 tool calls, delivery feedback and cancellation. Polling remains sufficient for
 non-streaming jobs; SSE is not the voice transport because voice needs traffic
 in both directions. No cloud inference or cloud fallback.
 
-### Implemented bounded first slice (2026-10-06)
+### Implemented bounded slice (2026-10-10)
 
 - `service.py`, `service_protocol.py` and `client.py` provide authenticated
   loopback REST, bounded jobs, JSON WebSocket text/tool events, readiness,
   cancellation, instance checks and a cached-only startup profile (`text`/`voice`).
-  Supported job kinds are **text, dialogue, tts, stt**. Actual `JobSpec` fields
+  Supported job kinds are **text, tts, stt**; `dialogue` and session
+  `delivery_mode` were removed outright. Actual `JobSpec` fields
   differ from section 4's proposed request; see the usage document.
 - Three serialized worker lanes (text, TTS, STT) keep blocking host work off the
   HTTP event loop. Text owns a llama.cpp subprocess; speech uses sherpa-onnx in
@@ -38,21 +42,40 @@ in both directions. No cloud inference or cloud fallback.
 - PCM is uploaded/downloaded as bounded **REST artifacts in memory**. There is
   **no binary WebSocket audio or sample-credit protocol**. STT takes a complete
   utterance and returns final text; offline SenseVoice produces no partials.
-- The Python `ServiceClient` automatically spawns/owns a contained service by
-  default, or attaches to an explicitly supplied loopback URL. Tokens travel via
+- The synchronous Python application entry is `orchestrator.client.ServiceClient`:
+  use `start_owned(...)` for a contained cached service or `attach(...)` for an
+  existing loopback service. Importing the package root does not load optional
+  client dependencies. Tokens travel via
   environment/header, not arguments. Attached clients never shut the service down.
   The current service token itself authorizes shutdown when `spawned_owner=True`
   (the CLI default); there is no separate owner-only credential.
 - The voice experiment's `main.py` now uses this client. Capture, local Silero
   VAD, playback, DAC delivery ledger and history trimming remain **client-side**.
   The server has **no history mirror or delivery reconciliation**.
-- Remote tools use a compiled allowlist containing **only `config_set`**; the
-  service validates calls and waits for a correlated client-executed result.
-  This is not arbitrary tool upload or a Unity action dispatcher.
+- Remote tools accept arbitrary bounded, reference-free validated function
+  declarations. Implementations stay client-side; the service validates calls
+  and waits for a correlated result. Python exposes `TextResult`/`ToolOutcome`,
+  including rejected attempts, model versus dispatch identities, server delivery
+  facts and separate local execution evidence. Cancellation uses `threading.Event`;
+  caller-thread callbacks/tools cannot be forcibly interrupted. Unknown outcomes
+  never imply rollback of side effects. Tools plus response schemas are rejected;
+  schema output accepts bounded object, array and scalar JSON roots.
+- Submit/get/cancel and socket job-state events share canonical bounded snapshots.
+  Startup failure rolls back loaded ownership after native work ends; failed
+  unload retains the store lock. Socket cleanup is detached/bounded so it cannot
+  stall worker lanes or housekeeping. Complete output/envelope byte budgets are
+  checked before success. Errors preserve sanitized status/retryability/correlation;
+  artifact cleanup does not discard verified audio. See usage for deadline and
+  ambiguous-upload ownership limitations.
 - Models and the llama.cpp runtime must already be cached. Startup does not
   download either; missing selected assets fail. Selection still uses individual
   eligibility/fit checks, not joint portfolio admission. There is no provisioning
-  endpoint, Unity resource telemetry or Unity client.
+  endpoint or Unity resource telemetry. The Unity client returns typed canonical
+  jobs/tool attempts, validates local authority and dispatches callbacks on
+  workers. The interview only completes a ready save after successful turns.
+  Its offline loopback HTTP/WebSocket EditMode boundary tests pass; see
+  [Unity validation](../Unity/README.md#validation). These tests do not establish
+  current real-model/audio/player acceptance after the contract changes.
 - Real-model smoke passed: `out/service_smoke_peter/report.json` in the voice
   experiment, Granite 4.2-8B / Kokoro / SenseVoice, validated config with username
   `Max`, medieval style and AI name `Peter`. This was TTS → offline WAV → STT,
@@ -67,8 +90,10 @@ and its [text](../ideas/model-orchestrator/text.md),
 [3D](../ideas/model-orchestrator/three-d.md) and
 [catalog](../ideas/model-orchestrator/catalog.md) notes.
 Experiment [0107](../experiments/unity-integration/0107-unity-orchestrator-bridge/README.md)
-is still inconclusive for Unity. The Python service slice has measured smoke
-evidence; that does not establish the full Unity design.
+is a historical bridge spike, not the status of today's
+[Unity implementation](../Unity/README.md). The Python service has historical
+real-model smoke evidence and both clients have offline boundary coverage;
+that does not establish the full proposed Unity voice transport.
 
 For this service, replace the earlier raw-file-path handoff with opaque artifact
 IDs, automatic gameplay-triggered downloads with explicit provisioning, and
@@ -167,13 +192,16 @@ validation/admission, with no download/inference in the request handler.
 | `GET /v1/artifacts/{id}` | Authorized bounded binary download by cache ID, size/hash/content type; range support for larger future assets. No filesystem path. |
 | `POST /v1/control/shutdown` | Spawned-owner credential only; drain, cancel, unload and close; forbidden to ordinary attached clients. |
 
-First-slice job kinds: `text` and `dialogue`; standalone TTS/STT follow only as
+**Historical proposal, not the shipped JobSpec:** first-slice job kinds were
+`text` and `dialogue`; standalone TTS/STT would follow only as
 their adapter contracts exist. Reject unimplemented modalities with
 `UNSUPPORTED_KIND`. `dialogue` jobs specify text input or are allocated by
 `turn.start` for voice input. Streaming output requires an attached session
 socket; otherwise reject rather than silently generating undeliverable audio.
 
-Example gameplay request (no model knobs):
+Historical proposed gameplay request (no model knobs; **not accepted** by the
+current service, which uses `kind: text` and `messages`/`text`, without
+`input`/`output`/`seed`):
 
 ```json
 {

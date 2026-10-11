@@ -31,17 +31,14 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from config_schema import CONFIG_SCHEMA, validate_config  # noqa: E402
+from consumer_results import json_value  # noqa: E402
 from interview import Interview  # noqa: E402
 from orchestrator import (  # noqa: E402
-    Conversation,
     JsonConfigTool,
-    ModelOrchestrator,
-    Modality,
     ToolRegistry,
 )
 from orchestrator.errors import OrchestratorError  # noqa: E402
 from orchestrator.client import ServiceClient  # noqa: E402
-from orchestrator.hosts import text as text_host  # noqa: E402
 
 pytestmark = pytest.mark.llm
 
@@ -70,23 +67,26 @@ class LlmPlayer:
     answers the AI's actual question, inventing its own values.
     """
 
-    def __init__(self, orchestrator: ModelOrchestrator) -> None:
-        self.conversation = Conversation(
-            orchestrator, _PLAYER_SYSTEM, max_tokens=80, temperature=0.8
-        )
+    def __init__(self, orchestrator: ServiceClient) -> None:
+        self.orchestrator = orchestrator
+        self.history = [{"role": "system", "content": _PLAYER_SYSTEM}]
 
     def reply(self, ai_line: str, missing: list[str]) -> str:
         field = missing[0] if missing else "story"
         hint = f"(The AI still needs {field}.)"
-        text = self.conversation.say(f"{ai_line}\n\n{hint}")
-        return (text or "").strip() or "I don't mind."
+        self.history.append({"role": "user", "content": f"{ai_line}\n\n{hint}"})
+        result = self.orchestrator.chat(self.history, max_tokens=80, temperature=0.8)
+        if result.state != "succeeded":
+            raise OrchestratorError("Live player turn was cancelled")
+        self.history.append({"role": "assistant", "content": result.text})
+        return result.text.strip() or "I don't mind."
 
 
 @pytest.fixture(scope="module")
 def orchestrator():
     """A real orchestrator with a text model loaded, or skip."""
     try:
-        mo = ServiceClient(profile="text")
+        mo = ServiceClient.start_owned(profile="text")
     except OrchestratorError as exc:
         pytest.skip(f"no text model available: {exc}")
     yield mo
@@ -95,16 +95,20 @@ def orchestrator():
 
 @pytest.fixture
 def exchanges(monkeypatch):
-    """Record every request payload and response the text host makes."""
+    """Record application requests/results; the text host is in another process."""
     recorded: list[dict] = []
-    original = text_host.TextHost._post
+    original = ServiceClient.chat_with_tools
 
-    def recording_post(self, path, payload):
-        response = original(self, path, payload)
-        recorded.append({"path": path, "payload": payload, "response": response})
-        return response
+    def recording_chat(self, messages, registry, **options):
+        result = original(self, messages, registry, **options)
+        recorded.append({
+            "payload": {"messages": json_value(messages), "tools": registry.specs(),
+                        **options},
+            "result": json_value(result),
+        })
+        return result
 
-    monkeypatch.setattr(text_host.TextHost, "_post", recording_post)
+    monkeypatch.setattr(ServiceClient, "chat_with_tools", recording_chat)
     return recorded
 
 
@@ -137,10 +141,11 @@ def _write_failure(transcript: list[str], exchanges: list[dict]) -> Path:
             f"max_tokens={payload.get('max_tokens')} "
             f"tool_choice={payload.get('tool_choice')} ---"
         )
-        msg = ex["response"].get("choices", [{}])[0].get("message", {})
-        lines.append("--- RESPONSE message ---")
-        lines.append(f"content: {msg.get('content')!r}")
-        lines.append(f"tool_calls: {json.dumps(msg.get('tool_calls'))}")
+        result = ex["result"]
+        lines.append("--- APPLICATION RESULT ---")
+        lines.append(f"state: {result['state']}; job_id: {result['job_id']}")
+        lines.append(f"content: {result['text']!r}")
+        lines.append(f"tool_calls: {json.dumps(result['calls'])}")
     out.write_text("\n".join(lines), encoding="utf-8")
     return out
 

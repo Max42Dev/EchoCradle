@@ -28,7 +28,7 @@ class Interview:
         emit("First sentence here.")
         emit("Second unheard sentence.")
         self.history.append({"role": "assistant", "content": "Generated full reply."})
-        return TurnResult(say="Generated full reply.", config={}, done=False), stop()
+        return TurnResult(say="Generated full reply.", config={}, done=False), stop.is_set()
 
 
 class Player:
@@ -123,7 +123,7 @@ def test_sentence_callback_never_waits_for_slow_tts(tmp_path):
                 emit(f"Sentence {index}.")
             drained.set()
             self.history.append({"role": "assistant", "content": "Generated full reply."})
-            return TurnResult(say="Generated full reply.", config={}, done=False), stop()
+            return TurnResult(say="Generated full reply.", config={}, done=False), stop.is_set()
 
     def synthesize(text):
         entered.set()
@@ -163,3 +163,25 @@ def test_interview_defaults_delegate_models_and_voice_to_service():
     assert args.service_url is None
     attached = app.build_parser().parse_args(["--service-url", "http://127.0.0.1:5010"])
     assert attached.service_url == "http://127.0.0.1:5010"
+
+
+def test_remote_generation_cancel_aborts_playback_without_microphone(tmp_path):
+    class CancelledInterview(Interview):
+        def opening_streaming(self, emit, cancellation):
+            assert isinstance(cancellation, threading.Event)
+            self.turns += 1
+            self.history.append({"role": "assistant", "content": ""})
+            return TurnResult(say="", config={"username": "Ada"}, done=False), True
+
+    player = Player()
+    interview = CancelledInterview()
+    mo = SimpleNamespace(tts=SimpleNamespace(
+        synthesize_samples=lambda text: pytest.fail("Cancelled turn synthesized speech")
+    ))
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        args = SimpleNamespace(tts=True, play=True, tts_executor=executor)
+        turn, interrupted, _ = app._run_turn(
+            interview, mo, player, None, tmp_path, 0, args, opening=True,
+        )
+    assert interrupted and player.aborted.is_set()
+    assert turn.config == {"username": "Ada"} and not interview.history

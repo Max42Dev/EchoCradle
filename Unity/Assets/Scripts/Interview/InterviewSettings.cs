@@ -18,12 +18,13 @@ namespace EchoCradle.Interview
             // Reject unsafe timing/buffer values before starting devices or model jobs.
             JObject mic = (JObject)data["microphone"];
             Require((int)mic["sampleRate"] == 16000 && (int)mic["blockSamples"] == 320);
+            Require((double)mic["calibrationSeconds"] > 0 && (double)mic["calibrationSeconds"] <= 5);
+            Require((double)mic["noiseFloorMultiple"] > 0 && (double)mic["noiseFloorMultiple"] <= 100);
             JObject vad = (JObject)data["vad"];
             Require((float)vad["threshold"] > 0 && (float)vad["threshold"] < 1);
             Require((float)vad["targetRms"] > 0 && (float)vad["peakLimit"] > 0 && (float)vad["peakLimit"] <= 1);
             Require((float)vad["maxGain"] >= 1 && (float)vad["maxGain"] <= 100);
             Require((float)vad["gainTimeSeconds"] > 0);
-            Require((float)data["completion"]["quietSeconds"] >= 0.5f && (float)data["completion"]["quietSeconds"] <= 3);
             Require((float)mic["onsetSeconds"] >= 0.04f && (float)mic["onsetSeconds"] <= 1);
             Require((float)mic["silenceSeconds"] >= 0.2f && (float)mic["silenceSeconds"] <= 3);
             Require((float)mic["preRollSeconds"] >= 0 && (float)mic["preRollSeconds"] <= 1);

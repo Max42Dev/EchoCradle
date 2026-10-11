@@ -91,7 +91,11 @@ Windows kill-on-close Job Object.
 
 Unity continuously captures audio into fixed buffers. One bounded background
 worker runs Silero with the experiment's VAD-only running gain controls; recorded
-PCM remains unchanged. Confirmed speech stops current playback and cancels text
+PCM remains unchanged. Before the first turn, stay quiet during the 0.6-second
+noise-floor calibration. The worker measures median block RMS and prevents gain
+boosting below four times that floor, matching the experiment. Calibration audio
+is discarded before onset/pre-roll; it is not transcribed. This is not word
+detection and does not guarantee rejection of louder breaths. Confirmed speech stops current playback and cancels text
 and synthesis delivery. Late native TTS work may finish, but its result is not
 played. Cancelled dialogue sessions are deleted and recreated before the next
 turn. Client-side `config_set` validates every value; obsolete sessions and
@@ -111,17 +115,111 @@ New game immediately creates:
 `%USERPROFILE%/AppData/LocalLow/EchoCradle/EchoCradle/Saves/<random-id>/`
 
 `session.json` records a random deterministic-generation seed, timestamps and
-`status: interview`. Only after all required fields validate and closing speech
-finishes does the client atomically write `config.json` and publish
+`status: interview`. As soon as all required fields are recorded, the client stops
+microphone capture, playback and generation, atomically writes `config.json` and publishes
 `status: ready`. The config contains `username`, `style`, `ai_name`, and an
-optional `story` supplied voluntarily. A final quiet interval allows a last
-correction before committing. Cancelled/error sessions remain incomplete and
+No story question is part of this interview. No farewell, quiet interval, or additional
+utterance is required. Cancelled/error sessions remain incomplete and
 are not loadable; no generated transcript or microphone recording is saved.
 
 The path is Unity's `Application.persistentDataPath`; it appears on screen. No
 Git-backed save system or Load game implementation is included.
 
 ## Validation
+
+### Deterministic PCM replay regression harness
+
+`SpeechCaptureProcessor` is the production microphone worker's endpointing code,
+not a parallel simulation. It accepts fixed 16 kHz mono float blocks and an
+injectable VAD function; production binds `SileroDetector.Process`. Replay tests
+use scripted VAD decisions and known synthetic sample values, including clipped
+PCM16 values, wrapped pre-roll and reused input buffers. The same `CaptureHandoff`
+publishes ordered onset/PCM events. Queue each block's sample watermark before
+processing; only successful processing advances it, after event/state publication.
+One worker owns processing and buffers; readers observe state only, checking the
+processing watermark before speech state. Polling and event-callback disposal
+remain in `MicrophoneCapture` unchanged.
+
+`SpeechCaptureProcessorTests` covers consecutive utterances, onset confirmation
+reset, resumed speech resetting silence, maximum-length truncation, input bounds,
+and a worker held inside VAD by an explicit gate (no timing-based onset guess).
+Two `OrchestrationTransportTests` replay confirmed onset during scripted text and
+a stalled TTS artifact read, then cancel the real client's token. They validate
+transport cancellation/absence of returned synthesis audio, **not** controller
+playback, late native synthesis completion, or physical audible interruption.
+
+These deterministic tests do not load models, record microphone input or validate
+recognizer accuracy. Fake service transcripts are protocol controls, not STT
+evidence. No saved-WAV real Silero/recognition replay is added in this change:
+that remains an opt-in integration task with human-labelled 16 kHz mono WAV
+controls and already-cached models/service (no provisioning/downloads). Full
+`InterviewController` FIFO/admission, late TTS/playback suppression, cancellation
+during callbacks, real recognition and save completion still need integration
+acceptance. The new tests have not been run as part of this change; the main
+assistant must compile and run them in Unity.
+
+### Orchestrator contract (2026-10-10)
+
+`OrchestratorClient.TextAsync` submits `kind: text` and returns `OrchestratorJob`,
+not an ordinary string on cancellation. Session creation sends **tools only**;
+there is no `dialogue` job kind or `delivery_mode`. `SubmitAsync`, `GetJobAsync`
+and `CancelAsync` validate the same canonical version/instance/job snapshot.
+Inspect `State`, `Error`, `Revision`, `HostPending` and `SelectedModel`. A terminal
+cancelled job can still have native work pending. `Text` is authoritative server
+text; `PartialText` is received streaming text, which may not have been spoken.
+The interview flushes speech and commits a ready save only on successful turns.
+
+Tool attempts come from the server's final `calls`, including rejected attempts.
+`ModelCallId` is model-owned and nullable when interrupted; `DispatchId` is the
+nullable dispatch UUID. Socket `tool.call.call_id` is **only** that dispatch UUID.
+`Outcome` and `ResultDelivered` are server facts. `LocallyExecuted` and
+`LocallyExecutedDispatchIds` record local invocation evidence separately, never
+delivery. Cancellation does not undo side effects; already-running synchronous
+handlers cannot be forcibly stopped. Late execution after return is not included
+in the returned evidence snapshot. Keep handlers short, thread-safe and revocable
+(the interview's active-generation guard remains authoritative).
+
+Callbacks and tool handlers run on workers, never on the Unity main thread.
+Local tool authority accepts a deliberately narrow schema subset: closed object
+roots with required primitive properties, enum, string lengths and numeric bounds.
+Unsupported schema keywords fail session creation; socket arguments are validated
+before invocation. JSON remains strict, depth/UTF-8/size bounded; IDs, booleans,
+states and error metadata are validated. Exceptions retain `Code`, `HttpStatus`,
+`Retryable`, `JobId`, `Phase` and optional last `Snapshot`, not remote prose or
+inner transport exceptions.
+
+Text's total deadline includes waiting for another turn, admission and reads.
+TTS/STT have a 120-second total operation budget including artifact I/O/cleanup;
+each request/read is also bounded to five seconds. Cancellation interrupts Mono
+streams even when their `ReadAsync` ignores the token. Confirmed cancellation is
+returned as a typed terminal snapshot when reconciliation fits the remaining
+budget; otherwise cancellation/deadline/transport failure is explicit, never
+invented as server completion. Best-effort ambiguous admission recovery uses
+the original idempotency key in a detached bounded cleanup task; it does not
+extend the caller's operation deadline. Session deletion is an additional safety
+net. Advanced `SubmitAsync` only admits: callers own subsequent polling/cancel.
+
+Verified TTS audio survives failed artifact deletion. STT uploads are deleted on
+definite admission rejection only (validated 4xx or `503 NOT_READY`), never on an
+ambiguous transport/5xx failure. Admitted inputs belong to the service. Cleanup
+uses the remaining operation token, so cancellation can leave artifacts for the
+service's retention expiry rather than extending the budget.
+
+Offline EditMode boundary tests use a real loopback TCP HTTP/WebSocket fixture,
+not private-method transport mocks or model inference. They cover a successful
+text/tool/TTS/STT slice, rejected attempts, interrupted tool IDs/delivery,
+canonical submit/get/cancel, structured errors, argument rejection, identity
+changes, deadline and stalled artifact reads, integrity, and cleanup ownership.
+The existing domain tests cover preference validation and atomic ready saves.
+Live model reliability, microphone interruption, audible playback, IL2CPP and a
+fresh player build still require integration acceptance; the explicit real-model
+test is intentionally excluded from offline runs.
+
+Final Unity 6000.6.3f1 batch EditMode verification on 2026-10-10:
+**53 passed, 0 failed, 1 explicit real-model test skipped**. Report:
+`Logs/orchestration-final-tests.xml` (generated/ignored). The actual Unity editor
+compiled the runtime and interview consumers; no external compiler fallback or
+model download was needed. `git diff --check` passed.
 
 Verified on 2026-10-07 with Unity 6000.6.3f1:
 **40 EditMode tests passed**, **1 PlayMode scene test passed**, and the explicit

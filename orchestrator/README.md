@@ -2,10 +2,14 @@
 
 One local model service, with an engine-neutral Python `ServiceClient`, backed
 by the planner, shared store and host adapters. The **bounded first slice is
-implemented as of 2026-10-06**: loopback REST jobs/artifacts and JSON WebSocket
+implemented, with contract hardening as of 2026-10-10**: loopback REST jobs/artifacts and JSON WebSocket
 text/tool events. It starts from **cached models and runtime binaries only**;
 there are no automatic service downloads. The Python client is synchronous and
-can block; use a worker for UI integration. No Unity client exists yet.
+can block; use a worker for UI integration. The Unity client and interview
+prototype are implemented; see [Unity usage and validation](../Unity/README.md).
+The application entry point is `orchestrator.client.ServiceClient`, using explicit
+`start_owned(...)` or `attach(...)`; the package root does not import optional
+client dependencies.
 
 This implements parts of the design in
 [`ideas/model-orchestrator/`](../ideas/model-orchestrator/modelorchestrator.md).
@@ -19,10 +23,11 @@ See [service usage](../docs/SERVICE_USAGE.md) for exact commands and wire fields
 | Catalog, probe, planner, store | ✅ implemented and tested |
 | Text host (llama.cpp) | ✅ verified end to end |
 | Speech hosts (sherpa-onnx TTS + online/offline STT) | ✅ real-model round trip; service returns final STT only |
-| Remote tools | ✅ compiled `config_set` only; client executes validated mutations |
+| Remote tools | ✅ arbitrary validated function declarations; implementations stay client-side |
 | Image / 3D / music / SFX hosts | ⬜ not yet |
 | REST jobs/artifacts + JSON WebSocket; Python client | ✅ bounded first slice implemented |
-| Unity client / binary WebSocket PCM / credits | ⬜ not yet |
+| Unity client / interview prototype | ✅ typed jobs/tool outcomes; offline boundary tests pass |
+| Binary WebSocket PCM / credits | ⬜ not yet |
 | Server history / delivery reconciliation / provisioning | ⬜ not yet (delivery ledger exists in Python experiment client) |
 | VRAM bin-packing scheduler | ⬜ not yet (one model per host) |
 
@@ -112,6 +117,7 @@ No unimplemented image/3D/audio runtime entries are invented.
 ```powershell
 cd c:\projects\EchoCradle
 python -m pip install -e .\orchestrator          # core, no heavy deps
+python -m pip install -e ".\orchestrator[service]" # Python transport + service, no native speech runtime
 python -m pip install -e ".\orchestrator[speech]" # + sherpa-onnx, numpy, sounddevice
 python -m pip install -e ".\orchestrator[all,dev]" # service + text + speech + tests
 ```
@@ -152,6 +158,47 @@ gameplay requests. For standalone port 5010, secure environment token generation
 attached mode and smoke commands, see [service usage](../docs/SERVICE_USAGE.md).
 Attached clients never shut down the service, although the service's same bearer
 token authorizes shutdown under its default `spawned_owner=True` configuration.
+
+### Application API
+
+```python
+import threading
+
+from orchestrator.client import ServiceClient, ServiceClientError
+from orchestrator.client_types import Capabilities, Message, TextResult
+
+messages: list[Message] = [{"role": "user", "content": "Hello"}]
+cancellation = threading.Event()  # Another thread may call cancellation.set().
+with ServiceClient.start_owned(profile="text") as client:
+  capabilities: Capabilities = client.capabilities()
+  try:
+    result: TextResult = client.stream_chat(
+      messages, on_text=lambda delta: print(delta, end="", flush=True),
+      cancellation=cancellation, timeout=30,
+    )
+    if result.state == "succeeded":
+      print(result.text)
+    else:  # Confirmed cancellation; text is not successful completion.
+      print("Cancelled", result.job_id)
+  except ServiceClientError as error:
+    print(error.code, error.status, error.retryable, error.job_id, error.phase)
+```
+
+For an existing service use `ServiceClient.attach("http://127.0.0.1:5010")`;
+the token comes from `ECHOCRADLE_SERVICE_TOKEN` (or the explicit `token` argument).
+Attachment has no process ownership and does not change deployment policy.
+`chat`, `stream_chat`, `chat_with_tools` and `stream_chat_with_tools` return
+`TextResult`, not a string, iterator or `(text, calls)` tuple. Streaming delivers
+deltas through `on_text`; the blocking method returns the authoritative outcome.
+Failed jobs/transport/callbacks raise `ServiceClientError`, optionally carrying
+`partial_result`. Confirmed cancelled text returns `state="cancelled"`.
+
+`TextResult.calls` is a tuple of immutable `ToolOutcome` records: model-call and
+dispatch IDs, arguments/result, server outcome, model-result delivery and separate
+local execution evidence. Cancellation never undoes side effects. User callbacks
+and tools run on the caller thread and cannot be forcibly interrupted; keep them
+short. See [service usage](../docs/SERVICE_USAGE.md#python-application-client)
+for registry contracts, error metadata, deadlines and cleanup limitations.
 
 ## In-process host API (model experiments)
 
@@ -216,15 +263,15 @@ request ──► Planner ──► ModelStore ──► RuntimeHost ──► a
 | `probe.py` | VRAM / RAM / disk detection and the tier formula |
 | `store.py` | the shared model directory, lazy download, extraction |
 | `planner.py` | eligible catalog preference, or best quality/fit fallback |
-| `tasks.py` | requests, priorities, states, artifacts |
 | `tools.py` | generic tools the model can call (JSON config read/write) |
 | `streaming.py` | the incremental sentence splitter (LLM → TTS bridge) |
 | `hosts/text.py` | llama.cpp `llama-server` lifecycle and chat |
 | `hosts/speech.py` | sherpa-onnx TTS, streaming and offline STT |
 | `orchestrator.py` | synchronous in-process host facade |
-| `service_protocol.py` | exact bounded JobSpec, envelopes and compiled tools |
+| `service_protocol.py` | exact bounded JobSpec, envelopes and validated tool declarations |
 | `service.py` | cached-only profile, auth, REST/JSON WebSocket, jobs and worker lanes |
 | `client.py` | synchronous remote API, owned/attached lifecycle and PCM artifacts |
+| `client_types.py` | message/capability types, registry protocol, immutable text/tool outcomes |
 
 ## Design rules this code follows
 
@@ -248,8 +295,14 @@ cd orchestrator
 python -m pytest -q
 ```
 
-The suite covers the catalog, probe, planner, store, streaming splitter and the
-tool layer. It needs no models and no GPU.
+The offline suite covers catalog/planning, hosts with fakes, strict schema and
+wire contracts, rollback/quotas, client lifecycle, HTTP/WebSocket boundaries,
+artifact integrity/ownership, typed outcomes and cancellation. It needs no
+models, GPU or audio devices. The current Unity EditMode boundary suite also
+passes; see [Unity validation](../Unity/README.md#validation). These results do
+not certify real-model reliability, live audio or a new player build after the
+2026-10-10 contract changes. Historical real-model evidence above is unchanged;
+the integration report will record final combined offline totals.
 
 ## Known limitations
 
@@ -267,7 +320,8 @@ tool layer. It needs no models and no GPU.
   return empty content. Recorded per model in the catalog.
 - **Bounded service, not the full Unity design.** PCM uses REST artifacts; there
   are no binary WebSocket credits, server history/delivery reconciliation,
-  provisioning or Unity client. Only compiled `config_set` is remotely exposed.
+  or provisioning. The shipped Unity client uses the bounded REST/JSON transport;
+  remote tools are arbitrary validated declarations, not a `config_set` allowlist.
 - **Final-only service STT.** Offline SenseVoice has no partials; this client
   does not expose partials from online recognizers either.
 - **Native crash risk.** Text/TTS/STT lanes are serialized threads, not isolated

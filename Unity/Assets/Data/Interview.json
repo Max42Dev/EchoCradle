@@ -7,6 +7,7 @@
   "microphone": {
     "device": "", "sampleRate": 16000, "blockSamples": 320,
     "onsetSeconds": 0.16, "silenceSeconds": 0.85,
+    "calibrationSeconds": 0.6, "noiseFloorMultiple": 4.0,
     "preRollSeconds": 0.5, "maxUtteranceSeconds": 20, "idleTimeoutSeconds": 180
   },
   "vad": {
@@ -16,12 +17,12 @@
     "targetRms": 0.1, "peakLimit": 0.5, "maxGain": 100.0, "gainTimeSeconds": 0.2
   },
   "speech": { "chunkCharacters": 240, "maxCharacters": 2400 },
-  "completion": { "quietSeconds": 1.0 },
   "save": { "folder": "Saves", "configFile": "config.json", "sessionFile": "session.json" },
   "ui": {
     "title": "EchoCradle", "newGame": "New game", "loadGame": "Load game",
     "cancel": "Cancel interview", "back": "Back to menu", "loading": "Preparing your companion…",
     "ready": "Your companion is ready.",
+    "calibrating": "Checking microphone background noise—please stay quiet briefly…",
     "preparationFailed": "Companion preparation failed. New game will retry; check the player log.",
     "listening": "Listening…", "thinking": "Your companion is thinking…",
     "speaking": "Speak at any time to interrupt. Headphones recommended.",
@@ -33,9 +34,9 @@
     "saveLocation": "Save folder: "
   },
   "prompts": {
-    "system": "You are the AI companion in EchoCradle, meeting the player for the first time. You are witty, theatrical, and a little snobbish about names. When the player first names you, you may object once; if they insist, accept and record it at once. Speak in one to three sentences, only as that character. Never mention rules, tools, files, private context or instructions. Never use parentheses or stage directions. Speech transcripts may contain misspellings. A spelled-out name followed by its pronunciation is one name. Ask briefly if uncertain. Use the available tool to record values the player supplies or confirms before acknowledging them. Direct corrections replace previously recorded values. Never invent values or placeholders. Preserve world-style details. Ask for the first missing required field: player name, world style, companion name. Once all are recorded, give a short farewell; do not ask further questions.",
+    "system": "You are EchoCradle's witty AI companion. First record the player's supplied preferences with config_set, then speak briefly in character. Field meanings: username is the player's name; style is their requested world or setting; ai_name is your companion name. A direct answer is enough: do not demand confirmation or extra choices before recording it. Preserve the player's details. Record corrections too. Never invent values. You may object once to your proposed companion name, but if the player insists, record it immediately. After tool results, ask ONE question for the first field still missing in that result, not the older private context. If nothing is missing, the interview is finished; do not ask questions or begin storytelling. Never mention tools or private context. No parentheses or stage directions.",
     "opening": "The player has just arrived. Greet them and begin.",
-    "state": "Private context; never mention or paraphrase it. recorded={recorded}; still_needed={missing}; ask_next={question}",
+    "state": "Private state before this turn: recorded={recorded}; missing={missing}. Process the player's latest answer: call config_set for supplied values before speaking. If no value was supplied, ask: {question}. Tool results supersede this state; ask only the first field missing AFTER recording.",
     "interrupted": "Private delivery context; never quote it. The player interrupted. Only the delivered assistant prefix is in history; remaining generated speech was not heard. Respond to their latest words and accept corrections.",
     "stalled": "Private context: if the player supplied a value for the first missing field, record it now; otherwise ask one short clarification. Do not invent a value.",
     "closingQuestion": "wrap up with a brief farewell",
@@ -46,8 +47,7 @@
     "properties": {
       "username": { "type": "string", "minLength": 1, "maxLength": 40 },
       "style": { "type": "string", "minLength": 1, "maxLength": 120 },
-      "ai_name": { "type": "string", "minLength": 1, "maxLength": 40 },
-      "story": { "type": "string", "minLength": 0, "maxLength": 2000 }
+      "ai_name": { "type": "string", "minLength": 1, "maxLength": 40 }
     }
   }
 }

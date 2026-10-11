@@ -51,6 +51,7 @@ from orchestrator.errors import OrchestratorError  # noqa: E402
 from orchestrator.client import ServiceClient  # noqa: E402
 
 from config_schema import CONFIG_SCHEMA, validate_config  # noqa: E402
+from consumer_results import json_value  # noqa: E402
 from interview import Interview  # noqa: E402
 
 DEFAULT_OUT = Path(__file__).resolve().parent.parent / "out" / "config.json"
@@ -121,9 +122,11 @@ def _run_turn(
         try:
             method = interview.opening_streaming if opening else interview.respond_streaming
             if opening:
-                results.append(method(on_sentence, cancelled.is_set))
+                results.append(method(on_sentence, cancelled))
             else:
-                results.append(method(user_text, on_sentence, cancelled.is_set))
+                results.append(method(user_text, on_sentence, cancelled))
+            if results[-1][1]:
+                cancelled.set()
         except BaseException as exc:
             failures.append(exc)
             cancelled.set()
@@ -189,6 +192,11 @@ def _run_turn(
                     player.abort()
                 print("\n  [barge-in] playback stopped; preserving your speech")
                 break
+            if cancelled.is_set() and results and results[-1][1]:
+                interrupted = True
+                with playback_gate:
+                    player.abort()
+                break
             if failures:
                 break
             time.sleep(0.01)
@@ -203,7 +211,11 @@ def _run_turn(
         speech_worker.join()
     if failures:
         raise failures[0]
-    turn, _ = results[0]
+    turn, generation_interrupted = results[0]
+    interrupted = interrupted or generation_interrupted
+    if interrupted:
+        with playback_gate:
+            player.abort()
     delivery = player.delivery()
     if interrupted:
         heard: list[str] = []
@@ -244,7 +256,9 @@ def _run_turn(
 def _report_turn(turn: Any) -> None:
     """Print the tool calls and schema problems a turn produced."""
     for call in turn.tool_calls:
-        print(f"  [tool] {call.name}({json.dumps(call.arguments)})")
+        print(f"  [tool] {call.name}({json.dumps(json_value(call.arguments))}) "
+              f"{call.outcome}, delivered={call.result_delivered}, "
+              f"local={call.executed_locally}")
     if turn.validation_errors:
         print(f"  [schema] {len(turn.validation_errors)} problem(s) reported to the model:")
         for problem in turn.validation_errors:
@@ -305,15 +319,18 @@ def run(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("Probing this machine ...")
-    mo = ServiceClient(
-        profile="voice" if args.tts or args.mic or args.stt_file else "text",
-        url=args.service_url,
-        shippable_only=args.shippable_only,
-        text_model=args.text_model,
-        tts_model=args.tts_model,
-        stt_model=args.stt_model,
-        speaker_id=args.speaker_id,
-    )
+    if args.service_url:
+        if any((args.shippable_only, args.text_model, args.tts_model,
+                args.stt_model, args.speaker_id is not None)):
+            raise OrchestratorError("Model/voice policy options require an owned service")
+        mo = ServiceClient.attach(args.service_url)
+    else:
+        mo = ServiceClient.start_owned(
+            profile="voice" if args.tts or args.mic or args.stt_file else "text",
+            shippable_only=args.shippable_only,
+            text_model=args.text_model, tts_model=args.tts_model,
+            stt_model=args.stt_model, speaker_id=args.speaker_id,
+        )
     try:
         return _run(args, mo, out_dir)
     finally:
@@ -323,7 +340,7 @@ def run(args: argparse.Namespace) -> int:
 
 def _run(args: argparse.Namespace, mo: ServiceClient, out_dir: Path) -> int:
     if args.capabilities:
-        print(json.dumps(mo.capabilities(), indent=2))
+        print(json.dumps(json_value(mo.capabilities()), indent=2))
         return 0
 
     probe = mo.report

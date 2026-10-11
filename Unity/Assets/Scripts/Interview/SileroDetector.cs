@@ -33,13 +33,13 @@ namespace EchoCradle.Interview
         [DllImport("kernel32", CharSet = CharSet.Ansi)] private static extern IntPtr GetProcAddress(IntPtr module, string name);
         [DllImport("kernel32")] private static extern bool FreeLibrary(IntPtr module);
         private IntPtr _library, _detector;
-        private Release _destroy, _pop;
+        private Release _destroy, _pop, _reset;
         private Feed _feed;
         private Query _detected, _empty;
         private readonly float[] _window = new float[512];
         private int _count;
         private readonly double _target, _peakLimit, _maximumGain, _alpha;
-        private double _runningRms;
+        private double _runningRms, _noiseThreshold;
 
         public SileroDetector(JObject settings)
         {
@@ -60,6 +60,7 @@ namespace EchoCradle.Interview
                 if (_library == IntPtr.Zero) throw new InvalidOperationException("VAD_RUNTIME_UNAVAILABLE");
                 _destroy = Function<Release>("SherpaOnnxDestroyVoiceActivityDetector");
                 _pop = Function<Release>("SherpaOnnxVoiceActivityDetectorPop");
+                _reset = Function<Release>("SherpaOnnxVoiceActivityDetectorReset");
                 _feed = Function<Feed>("SherpaOnnxVoiceActivityDetectorAcceptWaveform");
                 _detected = Function<Query>("SherpaOnnxVoiceActivityDetectorDetected");
                 _empty = Function<Query>("SherpaOnnxVoiceActivityDetectorEmpty");
@@ -84,6 +85,17 @@ namespace EchoCradle.Interview
             return Marshal.GetDelegateForFunctionPointer<T>(address);
         }
 
+        // Worker-owned: apply once before processing live speech.
+        public void SetNoiseFloor(double threshold)
+        {
+            if (double.IsNaN(threshold) || double.IsInfinity(threshold) || threshold < 0)
+                throw new ArgumentOutOfRangeException(nameof(threshold));
+            _noiseThreshold = threshold;
+            _runningRms = 0;
+            _count = 0;
+            _reset(_detector);
+        }
+
         public bool Process(float[] block)
         {
             bool detected = false;
@@ -95,8 +107,8 @@ namespace EchoCradle.Interview
                 foreach (float sample in _window) { sum += sample * sample; peak = Math.Max(peak, Math.Abs(sample)); }
                 double rms = Math.Sqrt(sum / 512);
                 _runningRms = _runningRms == 0 ? rms : _alpha * _runningRms + (1 - _alpha) * rms;
-                double gain = peak == 0 ? 1 : Math.Min(_maximumGain,
-                    Math.Min(_target / Math.Max(rms, _runningRms), _peakLimit / peak));
+                double gain = NoiseFloorCalibration.InputGain(rms, _runningRms, peak,
+                    _noiseThreshold, _target, _peakLimit, _maximumGain);
                 for (int i = 0; i < 512; i++) _window[i] *= (float)gain;
                 _feed(_detector, _window, 512);
                 detected |= _detected(_detector) != 0;

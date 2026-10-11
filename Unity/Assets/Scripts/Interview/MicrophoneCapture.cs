@@ -6,27 +6,28 @@ using UnityEngine;
 
 namespace EchoCradle.Interview
 {
-    /// <summary>Continuous mono capture with bounded pre-roll and RMS speech endpointing.</summary>
+    /// <summary>Continuous mono capture with bounded pre-roll and Silero speech endpointing.</summary>
     public sealed class MicrophoneCapture : IDisposable
     {
         private readonly string _device;
         private readonly AudioClip _clip;
-        private readonly float[] _block, _preRoll, _utterance;
-        private readonly float _onset, _silence;
+        private readonly float[] _block, _nativeBlock;
         private readonly BlockingCollection<float[]> _blocks = new BlockingCollection<float[]>(128);
         private readonly ConcurrentQueue<float[]> _free = new ConcurrentQueue<float[]>();
-        private readonly ConcurrentQueue<byte[]> _completed = new ConcurrentQueue<byte[]>();
+        private readonly CaptureHandoff _handoff = new CaptureHandoff();
         private readonly SileroDetector _vad;
+        private readonly SpeechCaptureProcessor _processor;
         private Task _worker;
-        private volatile bool _started, _failed;
-        private int _read, _preIndex, _preCount, _count;
-        private float _voiced, _quiet;
-        private volatile bool _active;
+        private volatile bool _failed;
+        private volatile bool _calibrated;
+        public bool IsCalibrated => _calibrated;
+        private int _read;
         private bool _disposed;
         public event Action SpeechStarted;
         public event Action<byte[]> Utterance;
-        public bool IsSpeaking => _active;
-        public bool HasPendingAudio => _active || _started || !_completed.IsEmpty || _blocks.Count > 0;
+        public bool IsSpeaking => _processor.IsSpeaking;
+        public bool HasPendingAudio => _processor.HasPendingAudio || (!_disposed &&
+            (Microphone.GetPosition(_device) - _read + _clip.samples) % _clip.samples >= _nativeBlock.Length);
 
         public MicrophoneCapture(JObject settings, SileroDetector vad)
         {
@@ -37,16 +38,25 @@ namespace EchoCradle.Interview
             _device = string.IsNullOrEmpty(requested) ? devices[0] : requested;
             if (Array.IndexOf(devices, _device) < 0) throw new InvalidOperationException("MICROPHONE_UNAVAILABLE");
             _block = new float[(int)settings["blockSamples"]];
-            _preRoll = new float[Math.Max(_block.Length, (int)((float)settings["preRollSeconds"] * 16000))];
-            _utterance = new float[(int)((float)settings["maxUtteranceSeconds"] * 16000)];
-            _onset = (float)settings["onsetSeconds"];
-            _silence = (float)settings["silenceSeconds"];
-            _clip = Microphone.Start(_device, true, 4, 16000);
-            if (_clip == null || _clip.channels != 1 || _clip.frequency != 16000)
+            var calibration = new NoiseFloorCalibration(_block.Length,
+                (double)settings["calibrationSeconds"], (double)settings["noiseFloorMultiple"]);
+            int captureRate = 16000;
+            string rateOverride = Environment.GetEnvironmentVariable("ECHOCRADLE_MICROPHONE_SAMPLE_RATE");
+            if (!string.IsNullOrEmpty(rateOverride) && (!int.TryParse(rateOverride, out captureRate) ||
+                captureRate < 16000 || captureRate > 192000 || (long)captureRate * _block.Length % 16000 != 0))
+                throw new InvalidOperationException("INVALID_CAPTURE_RATE");
+            _nativeBlock = captureRate == 16000 ? _block : new float[captureRate * _block.Length / 16000];
+            _processor = new SpeechCaptureProcessor(_block.Length,
+                Math.Max(_block.Length, (int)((float)settings["preRollSeconds"] * SpeechCaptureProcessor.SampleRate)),
+                (int)((float)settings["maxUtteranceSeconds"] * SpeechCaptureProcessor.SampleRate),
+                (float)settings["onsetSeconds"], (float)settings["silenceSeconds"], _vad.Process, _handoff);
+            _clip = Microphone.Start(_device, true, 4, captureRate);
+            if (_clip == null || _clip.channels != 1 || _clip.frequency != captureRate)
             {
                 Dispose();
                 throw new InvalidOperationException("MICROPHONE_UNAVAILABLE");
             }
+            Debug.Log("Microphone input: " + _device + "; " + _clip.frequency + " Hz; " + _clip.channels + " channel(s).");
             for (int i = 0; i < 130; i++) _free.Enqueue(new float[_block.Length]);
             _worker = Task.Run(() =>
             {
@@ -54,7 +64,18 @@ namespace EchoCradle.Interview
                 {
                     foreach (float[] block in _blocks.GetConsumingEnumerable())
                     {
-                        ProcessBlock(block);
+                        if (!calibration.IsComplete)
+                        {
+                            // Startup quiet audio is neither speech nor pre-roll. No onset events can escape.
+                            calibration.Add(block);
+                            if (calibration.IsComplete)
+                            {
+                                _vad.SetNoiseFloor(calibration.Threshold);
+                                _calibrated = true;
+                            }
+                            _handoff.ProcessedSamples(block.Length);
+                        }
+                        else _processor.ProcessBlock(block);
                         _free.Enqueue(block);
                     }
                 }
@@ -68,62 +89,28 @@ namespace EchoCradle.Interview
         {
             if (_disposed) return;
             if (_failed) throw new InvalidOperationException("VAD_CAPTURE_FAILED");
-            if (_started) { _started = false; SpeechStarted?.Invoke(); }
-            while (_completed.TryDequeue(out byte[] pcm)) Utterance?.Invoke(pcm);
+            while (_handoff.TryTake(out byte[] pcm))
+            {
+                if (pcm == null) SpeechStarted?.Invoke();
+                else Utterance?.Invoke(pcm);
+                // Event handlers can cancel and dispose this capture.
+                if (_disposed) return;
+            }
             if (!Microphone.IsRecording(_device)) throw new InvalidOperationException("MICROPHONE_UNAVAILABLE");
             int position = Microphone.GetPosition(_device);
             if (position < 0) throw new InvalidOperationException("MICROPHONE_UNAVAILABLE");
             int available = (position - _read + _clip.samples) % _clip.samples;
-            while (available >= _block.Length)
+            while (available >= _nativeBlock.Length)
             {
-                if (!_clip.GetData(_block, _read)) throw new InvalidOperationException("MICROPHONE_UNAVAILABLE");
-                _read = (_read + _block.Length) % _clip.samples;
-                available -= _block.Length;
+                if (!_clip.GetData(_nativeBlock, _read)) throw new InvalidOperationException("MICROPHONE_UNAVAILABLE");
+                _read = (_read + _nativeBlock.Length) % _clip.samples;
+                available -= _nativeBlock.Length;
+                if (!ReferenceEquals(_nativeBlock, _block)) MicrophoneResampler.ConvertBlock(_nativeBlock, _block);
                 if (!_free.TryDequeue(out float[] block)) throw new InvalidOperationException("CAPTURE_OVERRUN");
                 Array.Copy(_block, block, _block.Length);
+                _handoff.QueueSamples(block.Length);
                 if (!_blocks.TryAdd(block)) throw new InvalidOperationException("CAPTURE_OVERRUN");
             }
-        }
-
-        private void ProcessBlock(float[] block)
-        {
-            bool speech = _vad.Process(block);
-            float seconds = _block.Length / 16000f;
-            if (!_active)
-            {
-                for (int i = 0; i < _block.Length; i++)
-                {
-                    _preRoll[_preIndex] = block[i];
-                    _preIndex = (_preIndex + 1) % _preRoll.Length;
-                    _preCount = Math.Min(_preCount + 1, _preRoll.Length);
-                }
-                _voiced = speech ? _voiced + seconds : 0;
-                if (_voiced < _onset) return;
-                _active = true;
-                _count = 0;
-                int first = (_preIndex - _preCount + _preRoll.Length) % _preRoll.Length;
-                for (int i = 0; i < _preCount; i++) _utterance[_count++] = _preRoll[(first + i) % _preRoll.Length];
-                _quiet = 0;
-                _started = true;
-                return;
-            }
-            int copy = Math.Min(_block.Length, _utterance.Length - _count);
-            Array.Copy(block, 0, _utterance, _count, copy);
-            _count += copy;
-            _quiet = speech ? 0 : _quiet + seconds;
-            if (_quiet < _silence && _count < _utterance.Length) return;
-            var pcm = new byte[_count * 2];
-            for (int i = 0; i < _count; i++)
-            {
-                short sample = (short)(Math.Max(-1, Math.Min(1, _utterance[i])) * 32767);
-                pcm[i * 2] = (byte)sample;
-                pcm[i * 2 + 1] = (byte)(sample >> 8);
-            }
-            _voiced = _quiet = 0;
-            _count = _preCount = _preIndex = 0;
-            if (_completed.Count >= 2) throw new InvalidOperationException("UTTERANCE_OVERRUN");
-            _completed.Enqueue(pcm);
-            _active = false;
         }
 
         public void Dispose()

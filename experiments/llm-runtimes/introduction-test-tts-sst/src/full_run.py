@@ -27,6 +27,7 @@ from orchestrator import (  # noqa: E402
 from orchestrator.client import ServiceClient  # noqa: E402
 
 from config_schema import CONFIG_SCHEMA, validate_config  # noqa: E402
+from consumer_results import json_value  # noqa: E402
 from interview import Interview  # noqa: E402
 
 #: The player's answers, in order. Deterministic so the run always completes.
@@ -42,7 +43,7 @@ OUT = Path(__file__).resolve().parent.parent / "out" / "full_run_config.json"
 
 def main() -> int:
     print("Probing this machine ...")
-    mo = ServiceClient(profile="text")
+    mo = ServiceClient.start_owned(profile="text")
     try:
         return _run(mo)
     finally:
@@ -64,7 +65,7 @@ def _run(mo: ServiceClient) -> int:
     for i in range(12):
         print(f"ai>  {turn.say}")
         for call in turn.tool_calls:
-            print(f"  [tool] {call.name}({json.dumps(call.arguments)})")
+            print(f"  [tool] {call.name}({json.dumps(json_value(call.arguments))})")
         print(f"  config={tool.data}  missing={tool.missing()}")
         if turn.done or interview.complete:
             break
@@ -79,6 +80,9 @@ def _run(mo: ServiceClient) -> int:
     print(json.dumps(config, indent=2))
     print(f"\nvalidation: {'OK' if not errors else errors}")
 
+    if errors:
+        print("Not writing an invalid config.")
+        return 1
     OUT.parent.mkdir(parents=True, exist_ok=True)
     tool.data = config
     tool.save(OUT)

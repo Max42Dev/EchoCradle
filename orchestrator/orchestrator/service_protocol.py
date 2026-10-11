@@ -62,7 +62,7 @@ def _constant(value: str) -> Any:
     raise ValueError("non-finite JSON")
 
 
-def decode(raw: bytes | str, limit: int = JSON_LIMIT) -> dict[str, Any]:
+def decode_value(raw: bytes | str, limit: int = JSON_LIMIT) -> Any:
     """Reject duplicate keys, non-finite values and excessive structural depth."""
     try:
         if len(raw.encode("utf-8") if isinstance(raw, str) else raw) > limit:
@@ -79,11 +79,17 @@ def decode(raw: bytes | str, limit: int = JSON_LIMIT) -> dict[str, Any]:
                 stack.extend((item, depth + 1) for item in value)
             elif isinstance(value, float) and not math.isfinite(value):
                 raise ValueError("non-finite number")
-        if not isinstance(result, dict):
-            raise ValueError("not an object")
         return result
     except (ValueError, RecursionError, UnicodeError) as exc:
-        raise ServiceError("INVALID_JSON", "Expected a bounded JSON object.", 400) from exc
+        raise ServiceError("INVALID_JSON", "Expected a bounded JSON value.", 400) from exc
+
+
+def decode(raw: bytes | str, limit: int = JSON_LIMIT) -> dict[str, Any]:
+    """Request and event envelopes must remain objects."""
+    result = decode_value(raw, limit)
+    if not isinstance(result, dict):
+        raise ServiceError("INVALID_JSON", "Expected a bounded JSON object.", 400)
+    return result
 
 
 def fields(data: dict[str, Any], allowed: set[str], required: set[str] | None = None) -> None:
@@ -112,9 +118,9 @@ def integer(value: Any, minimum: int, maximum: int) -> int:
     return value
 
 
-def session_spec(data: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
+def session_spec(data: dict[str, Any]) -> list[dict[str, Any]]:
     """Tool declarations cross the wire; implementations stay client-side."""
-    fields(data, {"tools", "delivery_mode"})
+    fields(data, {"tools"})
     tools = data.get("tools", [])
     if not isinstance(tools, list) or len(tools) > 16:
         raise ServiceError("INVALID_SPEC", "At most sixteen tools are permitted.")
@@ -139,15 +145,12 @@ def session_spec(data: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
         if not isinstance(schema, dict) or schema.get("type") != "object":
             raise ServiceError("INVALID_SPEC", "Tool parameters must be an object schema.")
         JobSpec.parse({"kind": "text", "text": "validate", "json_schema": schema})
-    mode = data.get("delivery_mode", "text")
-    if mode not in ("text", "speech", "both"):
-        raise ServiceError("INVALID_SPEC", "Invalid delivery mode.")
-    return tools, mode
+    return tools
 
 
 @dataclass(frozen=True)
 class JobSpec:
-    kind: Literal["text", "dialogue", "tts", "stt"]
+    kind: Literal["text", "tts", "stt"]
     session_id: str | None = None
     turn_id: str | None = None
     messages: list[dict[str, str]] = field(default_factory=list)
@@ -164,7 +167,7 @@ class JobSpec:
     def parse(cls, data: dict[str, Any]) -> JobSpec:
         fields(data, set(cls.__dataclass_fields__), {"kind"})
         kind = data["kind"]
-        if kind not in ("text", "dialogue", "tts", "stt"):
+        if kind not in ("text", "tts", "stt"):
             raise ServiceError("UNSUPPORTED_KIND", "Unsupported job kind.")
         messages = data.get("messages", [])
         if not isinstance(messages, list) or len(messages) > 64:
@@ -177,8 +180,8 @@ class JobSpec:
                 raise ServiceError("INVALID_SPEC", "Invalid message role.")
             string(message["content"], 16_384)
         temperature = data.get("temperature", 0.7)
-        if (type(temperature) not in (int, float) or not math.isfinite(temperature)
-                or not 0 <= temperature <= 2):
+        if (type(temperature) not in (int, float) or not 0 <= temperature <= 2
+            or not math.isfinite(temperature)):
             raise ServiceError("INVALID_SPEC", "Temperature must be finite and within 0..2.")
         streaming = data.get("streaming", False)
         if type(streaming) is not bool:
@@ -213,7 +216,7 @@ class JobSpec:
             raise ServiceError("INVALID_SPEC", "PCM input is only valid for STT.")
         if kind == "tts" and (not text or messages or streaming):
             raise ServiceError("INVALID_SPEC", "TTS requires text and is not socket streaming.")
-        if kind in ("text", "dialogue") and not messages and not text:
+        if kind == "text" and not messages and not text:
             raise ServiceError("INVALID_SPEC", "Text jobs require messages or text.")
         return cls(
             kind=kind,
