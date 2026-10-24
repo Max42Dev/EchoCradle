@@ -1,0 +1,8 @@
+{
+    "name": "EchoCradle.CharacterPreview",
+    "rootNamespace": "EchoCradle.CharacterPreview",
+    "references": [
+        "glTFast"
+    ],
+    "autoReferenced": true
+}

@@ -20,8 +20,10 @@ HTTP surface can be layered on top later without changing this API.
 from __future__ import annotations
 
 import logging
+import threading
+from functools import wraps
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from orchestrator.catalog import Catalog, Modality
 from orchestrator.errors import ModelNotAvailableError, OrchestratorError
@@ -33,8 +35,18 @@ from orchestrator.planner import Planner
 from orchestrator.probe import ProbeReport, probe
 from orchestrator.runtimes import RuntimeCatalog
 from orchestrator.store import ModelStore
+from orchestrator.visual import VisualBackend, VisualError
 
 log = logging.getLogger("orchestrator")
+
+
+def _gpu_serialized(method):
+    """Hold the shared reentrant lane for synchronous text/lifecycle operations."""
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self.gpu_lock:
+            return method(self, *args, **kwargs)
+    return locked
 
 
 class ModelOrchestrator:
@@ -50,6 +62,7 @@ class ModelOrchestrator:
         shippable_only: bool = False,
         cache: Path | None = None,
         runtimes: RuntimeCatalog | None = None,
+        visual_config: Path | None = None,
     ) -> None:
         self.catalog = catalog if catalog is not None else Catalog.default()
         self.store = store or ModelStore()
@@ -57,6 +70,10 @@ class ModelOrchestrator:
         self.planner = Planner(self.catalog, self.report)
         self.shippable_only = shippable_only
         self.cache = cache or cache_dir()
+        # Service callers using hosts directly must take this same lock.
+        self.gpu_lock = threading.RLock()
+        self.visual = (VisualBackend(visual_config, shippable_only=shippable_only)
+                   if visual_config is not None else None)
 
         self.runtimes = runtimes if runtimes is not None else RuntimeCatalog.default()
         self.text = TextHost(base_url=text_base_url, runtime=self.runtimes.get("llama.cpp"))
@@ -81,6 +98,7 @@ class ModelOrchestrator:
                 log.warning("could not warm %s: %s", modality.value, exc)
         self._started = True
 
+    @_gpu_serialized
     def stop(self) -> None:
         for host in self._hosts.values():
             try:
@@ -135,6 +153,12 @@ class ModelOrchestrator:
         progress=None,
     ):
         """Plan, download if needed, and load a model for ``modality``."""
+        if modality is Modality.TEXT:
+            with self.gpu_lock:
+                return self._load_model(modality, model_id=model_id, progress=progress)
+        return self._load_model(modality, model_id=model_id, progress=progress)
+
+    def _load_model(self, modality: Modality, *, model_id: str | None = None, progress=None):
         plan = self.planner.plan(
             modality,
             shippable_only=self.shippable_only,
@@ -172,6 +196,7 @@ class ModelOrchestrator:
 
     # -- text --------------------------------------------------------------
 
+    @_gpu_serialized
     def chat(
         self,
         messages: list[dict[str, str]],
@@ -199,11 +224,21 @@ class ModelOrchestrator:
         model_id: str | None = None,
     ) -> Iterator[str]:
         """Stream a text completion as deltas."""
-        self._ensure_loaded(Modality.TEXT, model_id)
-        return self.text.stream_chat(
-            messages, max_tokens=max_tokens, temperature=temperature
-        )
+        # A generator must own the lane during iteration, not just construction.
+        # Exhaust/close it on the creating thread before another lane can run.
+        with self.gpu_lock:
+            self._ensure_loaded(Modality.TEXT, model_id)
+            stream = self.text.stream_chat(
+                messages, max_tokens=max_tokens, temperature=temperature
+            )
+            try:
+                yield from stream
+            finally:
+                close = getattr(stream, "close", None)
+                if close is not None:
+                    close()
 
+    @_gpu_serialized
     def chat_with_tools(
         self,
         messages: list[dict[str, str]],
@@ -227,6 +262,7 @@ class ModelOrchestrator:
             max_rounds=max_rounds,
         )
 
+    @_gpu_serialized
     def stream_chat_with_tools(
         self,
         messages: list[dict[str, str]],
@@ -256,6 +292,48 @@ class ModelOrchestrator:
             on_text=on_text,
             should_stop=should_stop,
         )
+
+    # -- experimental cached visual generation -----------------------------
+
+    def _visual_call(self, method: str, *args: Any, **kwargs: Any) -> Path:
+        with self.gpu_lock:
+            if self.shippable_only:
+                raise VisualError("Experimental visual stages forbidden in shippable_only mode")
+            if self.visual is None:
+                raise VisualError("Visual backend is not configured")
+            should_stop = kwargs.get("should_stop")
+            if should_stop is not None and should_stop():
+                from orchestrator.visual import VisualCancelled
+
+                raise VisualCancelled("Visual generation cancelled")
+            # An external server is not owned by us: unload() cannot free its GPU.
+            if self.text.base_url is not None:
+                raise VisualError("Cannot release GPU memory owned by an external text server")
+            try:
+                self.text.unload()
+            except Exception as exc:
+                raise VisualError("Could not unload text before visual inference") from exc
+            if self.text.loaded_model_id is not None or self.text._process is not None:
+                raise VisualError("Text host remains resident; visual inference refused")
+            # _ensure_loaded (or service ensure_model) lazily reloads text on next use.
+            return getattr(self.visual, method)(*args, **kwargs)
+
+    def generate_image(self, text: str, output: Path, *, seed: int,
+                       negative_prompt: str = "",
+                       should_stop: Callable[[], bool] | None = None) -> Path:
+        """Generate a cached experimental PNG, unloading text under ``gpu_lock``."""
+        return self._visual_call("generate_image", text, output, seed=seed,
+                                 negative_prompt=negative_prompt, should_stop=should_stop)
+
+    def generate_3d(self, image: Path, output: Path, *, seed: int,
+                    should_stop: Callable[[], bool] | None = None) -> Path:
+        """Reconstruct a static GLB from a PNG using the cached TripoSR worker."""
+        return self._visual_call("generate_3d", image, output, seed=seed, should_stop=should_stop)
+
+    def animate_3d(self, mesh: Path, output: Path, *, seed: int,
+                   should_stop: Callable[[], bool] | None = None) -> Path:
+        """Auto-rig, texture, generate and retarget five clips using cached 0110 workers."""
+        return self._visual_call("animate_3d", mesh, output, seed=seed, should_stop=should_stop)
 
     # -- speech ------------------------------------------------------------
 

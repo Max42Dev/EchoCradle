@@ -1,0 +1,12 @@
+{
+    "id": "courier_mira",
+    "description": "Mira, adult human courier, short chestnut hair, teal fitted tunic, brown trousers, ankle boots. Simplified local reconstruction pilot.",
+    "prompt": "full body, solo, 3d stylized female fantasy game character, short brown hair, teal tunic, brown trousers, boots, T-pose, arms extended sideways, standing, straight legs, front view, centered, plain white background, character concept, high quality",
+    "negative_prompt": "cropped, out of frame, forest, trees, scenery, multiple characters, bent legs, action pose, skirt, cloak, weapon, text, watermark",
+    "seed": 42,
+    "height_m": 1.7,
+    "width": 512,
+    "height": 512,
+    "steps": 35,
+    "guidance": 8.0
+}

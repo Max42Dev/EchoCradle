@@ -273,7 +273,7 @@ public sealed class InterviewTests
     }
 
     [Test]
-    public async Task Save_InvalidStateNeverBecomesReadyAndValidStatePersistsSeed()
+    public async Task Save_InvalidStateNeverBecomesDraftAndValidDraftPersistsSeedWithoutReadyMarker()
     {
         string root = Path.Combine(Path.GetTempPath(), "EchoCradle-test-" + Guid.NewGuid().ToString("N"));
         try
@@ -282,7 +282,7 @@ public sealed class InterviewTests
             var state = new InterviewState((JObject)config["schema"]);
             var invoke = state.SessionHandler();
             SaveGame save = await SaveGame.CreateAsync(root, (JObject)config["save"], CancellationToken.None);
-            try { await save.CompleteAsync(state.Snapshot(), state, CancellationToken.None); Assert.Fail(); }
+            try { await save.SaveDraftAsync(state.Snapshot(), state, CancellationToken.None); Assert.Fail(); }
             catch (InvalidOperationException) { }
             JObject session = JObject.Parse(File.ReadAllText(Path.Combine(save.Folder, "session.json")));
             Assert.That((string)session["status"], Is.EqualTo("interview"));
@@ -290,9 +290,10 @@ public sealed class InterviewTests
             state.AcceptTools(true);
             foreach (string field in new[] { "username", "style", "ai_name" })
                 invoke("config_set", new JObject { ["field"] = field, ["value"] = "test" });
-            await save.CompleteAsync(state.Snapshot(), state, CancellationToken.None);
+            await save.SaveDraftAsync(state.Snapshot(), state, CancellationToken.None);
             JObject ready = JObject.Parse(File.ReadAllText(Path.Combine(save.Folder, "session.json")));
-            Assert.That((string)ready["status"], Is.EqualTo("ready"));
+            Assert.That((string)ready["status"], Is.EqualTo("character_creation"));
+            Assert.That(ready["completedUtc"], Is.Null);
             Assert.That(ready["seed"], Is.EqualTo(session["seed"]));
             state.ValidateComplete(JObject.Parse(File.ReadAllText(Path.Combine(save.Folder, "config.json"))));
             Assert.That(Directory.GetFiles(save.Folder, "*.tmp"), Is.Empty);

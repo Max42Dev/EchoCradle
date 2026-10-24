@@ -32,9 +32,10 @@ namespace EchoCradle.Orchestration
             JobId = OrchestratorWire.Id(data["job_id"]);
             SessionId = OrchestratorWire.NullableId(data["session_id"]);
             TurnId = OrchestratorWire.NullableId(data["turn_id"]);
-            Kind = OrchestratorWire.Text(data["kind"], 8);
+            Kind = OrchestratorWire.Text(data["kind"], 32);
             State = OrchestratorWire.Text(data["state"], 32);
-            if (Kind != "text" && Kind != "tts" && Kind != "stt" ||
+            if (Kind != "text" && Kind != "tts" && Kind != "stt" &&
+                Kind != "image" && Kind != "image_to_3d" && Kind != "animate_3d" ||
                 !IsTerminal && State != "queued" && State != "running" && State != "waiting_tool")
                 throw new OrchestratorException("PROTOCOL_ERROR");
             Revision = OrchestratorWire.Integer(data["revision"], 1, int.MaxValue);

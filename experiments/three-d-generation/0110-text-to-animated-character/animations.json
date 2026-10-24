@@ -1,0 +1,49 @@
+{
+    "clips": [
+        {
+            "id": "Idle",
+            "prompt": "A person stands still relaxed and breathes gently.",
+            "frames": 80,
+            "fps": 20,
+            "seed": 10106,
+            "root_motion": "in_place",
+            "loop": true
+        },
+        {
+            "id": "Walk",
+            "prompt": "A person walks forward naturally at a steady pace.",
+            "frames": 120,
+            "fps": 20,
+            "seed": 10107,
+            "root_motion": "in_place",
+            "loop": true
+        },
+        {
+            "id": "Run",
+            "prompt": "A person runs forward at a steady pace.",
+            "frames": 80,
+            "fps": 20,
+            "seed": 10108,
+            "root_motion": "in_place",
+            "loop": true
+        },
+        {
+            "id": "Jump",
+            "prompt": "A person bends their knees, jumps up once and lands on both feet.",
+            "frames": 80,
+            "fps": 20,
+            "seed": 10109,
+            "root_motion": "in_place",
+            "loop": false
+        },
+        {
+            "id": "Attack",
+            "prompt": "A person throws one punch forward with their right hand then returns to standing.",
+            "frames": 80,
+            "fps": 20,
+            "seed": 10110,
+            "root_motion": "in_place",
+            "loop": false
+        }
+    ]
+}

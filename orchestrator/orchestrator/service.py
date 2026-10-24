@@ -1,10 +1,12 @@
-"""Local, cached-only REST/JSON-WebSocket service over the real host facade.
+"""Local REST/JSON-WebSocket service with automatic model/runtime provisioning.
 
 Run with ``python -m orchestrator.service``. The inherited environment must
 contain ECHOCRADLE_SERVICE_TOKEN. FastAPI, uvicorn and jsonschema are runtime
 dependencies; importing this module does not probe hardware or load models.
 
-This bounded slice intentionally has no device I/O, provisioning, conversation
+Missing text/speech models and the text runtime are provisioned anonymously by
+their native store/host adapters while holding the service writer lock.
+This bounded slice intentionally has no device I/O, conversation
 history, delivery reconciliation or binary WebSocket audio. PCM uses artifacts.
 Native inference is not forcibly interrupted: its lane stays reserved until
 the call returns. Native crashes still affect the entire service process.
@@ -23,27 +25,41 @@ import logging
 import os
 import socket
 import sys
+import tempfile
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from orchestrator.catalog import Catalog, Modality, ModelDescriptor
+from orchestrator.catalog import Catalog, Modality
 from orchestrator.hosts.text import TextHost
+from orchestrator.orchestrator import ModelOrchestrator
 from orchestrator.paths import model_store_dir
 from orchestrator.runtimes import RuntimeCatalog
 from orchestrator.service_protocol import (
     ARTIFACT_LIMIT, JSON_LIMIT, PCM_LIMIT,
-    PROTOCOL_VERSION, TERMINAL, TOOL_LIMIT, TTL_SECONDS, JobSpec, ServiceError,
+    PROTOCOL_VERSION, TERMINAL, TOOL_LIMIT, TTL_SECONDS, VISUAL_KINDS, VISUAL_LIMIT,
+    JobSpec, ServiceError,
     decode, decode_value, encode, envelope, fields, session_spec, string, uuid_string,
 )
-from orchestrator.store import InstalledModel, ModelStore, ProgressFn
+from orchestrator.store import ModelStore
 
 log = logging.getLogger(__name__)
+
+
+class _ServiceLogFormatter(logging.Formatter):
+    """Redact the service credential, including in formatted exception chains."""
+
+    def __init__(self, token: str) -> None:
+        super().__init__("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        self._token = token
+
+    def format(self, record: logging.LogRecord) -> str:
+        return super().format(record).replace(self._token, "[REDACTED]")
 
 
 @dataclass(frozen=True)
@@ -60,12 +76,15 @@ class ServiceConfig:
     store_root: Path | None = None
     runtime_config: Path | None = None
     model_catalog: Path | None = None
+    visual_config: Path | None = None
     allowed_origins: tuple[str, ...] = ()
     spawned_owner: bool = True
 
     def __post_init__(self) -> None:
-        if self.profile not in ("text", "voice") or not 0 <= self.port <= 65535:
+        if self.profile not in ("text", "voice", "visual") or not 0 <= self.port <= 65535:
             raise ValueError("Invalid profile or port")
+        if self.profile == "visual" and self.visual_config is None:
+            raise ServiceError("INVALID_CONFIG", "Visual profile requires visual_config.")
         if self.speaker_id is not None and self.speaker_id < 0:
             raise ValueError("speaker_id must be nonnegative")
         for origin in self.allowed_origins:
@@ -77,30 +96,31 @@ class ServiceConfig:
                 raise ValueError("Development origins must be exact loopback origins")
 
 
-class CachedModelStore(ModelStore):
-    """Never fall through to provisioning, even on an accidental facade call."""
+class _VisualFacade(ModelOrchestrator):
+    """Visual-only facade: never construct speech/text hosts or resolve runtimes."""
 
-    def ensure(
-        self, model: ModelDescriptor, *, progress: ProgressFn | None = None,
-    ) -> InstalledModel:
-        installed = self.installed(model)
-        if installed is None:
-            raise ServiceError("MODEL_NOT_PROVISIONED", "Selected model is not cached.", 503)
-        return installed
+    def __init__(self, config: ServiceConfig, store: CachedModelStore) -> None:
+        from orchestrator.probe import probe
+        from orchestrator.visual import VisualBackend
 
+        self.store = store
+        self.shippable_only = config.shippable_only
+        self.report = probe()
+        self.gpu_lock = threading.RLock()
+        self.visual = VisualBackend(config.visual_config, shippable_only=config.shippable_only)
+        self._hosts = {}
+        self._started = False
 
-class CachedTextHost(TextHost):
-    """The real text host, with its implicit llama.cpp download disabled."""
+    def _visual_call(self, method: str, *args: Any, **kwargs: Any) -> Path:
+        with self.gpu_lock:
+            if self.shippable_only:
+                raise ServiceError("NOT_SHIPPABLE", "Visual generation is experimental.", 422)
+            should_stop = kwargs.get("should_stop")
+            if should_stop is not None and should_stop():
+                from orchestrator.visual import VisualCancelled
 
-    def _ensure_binary(self) -> Path:
-        executable = self.binary_dir / self.runtime.executable
-        if not executable.is_file():
-            executable = next(self.binary_dir.rglob(self.runtime.executable), executable)
-        if not executable.is_file():
-            raise ServiceError(
-                "MODEL_NOT_PROVISIONED", "The local text runtime is not cached.", 503,
-            )
-        return executable
+                raise VisualCancelled("Visual generation cancelled")
+            return getattr(self.visual, method)(*args, **kwargs)
 
 
 class StoreWriterLock:
@@ -186,7 +206,11 @@ class _BoundaryMiddleware:
             if scope["type"] == "websocket":
                 await self.app(scope, receive, send)
                 return
-            limit = (PCM_LIMIT if scope["method"] == "POST"
+            media_type = next((v for k, v in scope.get("headers", [])
+                               if k.lower() == b"content-type"), b"")
+            upload_limit = (VISUAL_LIMIT if media_type in
+                            (b"image/png", b"model/gltf-binary") else PCM_LIMIT)
+            limit = (upload_limit if scope["method"] == "POST"
                      and scope["path"] == "/v1/artifacts" else JSON_LIMIT)
             lengths = [v for k, v in scope.get("headers", []) if k.lower() == b"content-length"]
             if lengths:
@@ -243,6 +267,7 @@ class _Artifact:
     sample_rate: int
     created: float = field(default_factory=time.monotonic)
     sha256: str = ""
+    media_type: str = "application/octet-stream"
 
     def __post_init__(self) -> None:
         self.sha256 = hashlib.sha256(self.pcm).hexdigest()
@@ -262,6 +287,7 @@ class _Job:
     completed: float | None = None
     cancel: threading.Event = field(default_factory=threading.Event)
     input_pcm: bytes | None = None
+    input_visual: bytes | None = None
 
     def should_stop(self) -> bool:
         return self.cancel.is_set() or time.monotonic() >= self.deadline
@@ -427,8 +453,10 @@ class _Runtime:
         self.artifact_bytes = 0
         self.loop: asyncio.AbstractEventLoop
         self.facade: Any = None
+        self._visual_diagnostics: dict[str, dict[str, Any]] | None = None
         self.store_lock = store_lock
-        self.queues = {name: asyncio.Queue(maxsize=16) for name in ("text", "tts", "stt")}
+        self.queues = {name: asyncio.Queue(maxsize=16)
+                   for name in ("text", "tts", "stt", "visual")}
         self.executors = {
             name: concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=name)
             for name in self.queues
@@ -494,17 +522,21 @@ class _Runtime:
         if self.store_lock is None:
             self.store_lock = StoreWriterLock(root)
         self.store_lock.acquire()
+        if self.config.profile == "visual":
+            self.facade = _VisualFacade(self.config, ModelStore(root))
+            return {"probe": self.facade.report.to_dict(), "planned": {}, "actual": {}}
         self.facade = ModelOrchestrator(
-            store=CachedModelStore(root), shippable_only=self.config.shippable_only,
+            store=ModelStore(root), shippable_only=self.config.shippable_only,
             catalog=Catalog.default(self.config.model_catalog),
             runtimes=RuntimeCatalog.default(self.config.runtime_config),
+            visual_config=self.config.visual_config,
         )
         # Avoid a fixed 8080 runtime port colliding with the public listener.
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as temporary:
             temporary.bind(("127.0.0.1", 0))
             runtime_port = temporary.getsockname()[1]
         runtime = self.facade.runtimes.get("llama.cpp")
-        host = CachedTextHost(
+        host = TextHost(
             port=runtime_port, context=4096, startup_timeout_s=90,
             runtime=runtime, binary_dir=runtime.cache_dir(root),
         )
@@ -554,6 +586,8 @@ class _Runtime:
         try:
             diagnostics = await asyncio.shield(native)
             self.diagnostics = diagnostics
+            native = self.native_call("visual", self._inspect_visual_availability)
+            self._visual_diagnostics = await asyncio.shield(native)
             if self.state == "starting":
                 self.state = "ready"
         except Exception as exc:
@@ -585,7 +619,8 @@ class _Runtime:
         kinds: dict[str, Any] = {}
         for kind in ("text", "tts", "stt"):
             lane = kind
-            supported = lane == "text" or self.config.profile == "voice"
+            supported = (self.config.profile == "voice"
+                         or lane == "text" and self.config.profile == "text")
             status = "unsupported" if not supported else (
                 "ready" if self.state == "ready" else
                 "unprovisioned" if self.startup_error and
@@ -593,25 +628,68 @@ class _Runtime:
                 "warming" if self.state == "starting" else "unavailable"
             )
             kinds[kind] = {"state": status, **self.diagnostics["actual"].get(lane, {})}
+        kinds.update(self.visual_availability())
         return {
             "service_instance_id": self.instance_id, "protocol_version": PROTOCOL_VERSION,
-            "profile": self.config.profile, "state": self.state, "cached_only": True,
+            "profile": self.config.profile, "state": self.state, "cached_only": False,
             "shippable_only": self.config.shippable_only, "portfolio_revision": 1,
             "kinds": kinds, **self.diagnostics,
             "limits": {
                 "sessions": 4, "queued_active_jobs": 16, "retained_jobs": 256,
                 "json_bytes": JSON_LIMIT, "tool_bytes": TOOL_LIMIT,
                 "pcm_upload_bytes": PCM_LIMIT, "artifact_bytes": ARTIFACT_LIMIT,
+                "visual_upload_bytes": VISUAL_LIMIT,
                 "artifact_count": 256, "ttl_seconds": TTL_SECONDS,
                 "max_tokens": 512, "tts_characters": 300, "tts_seconds": 20,
             },
             "pcm": {"format": "pcm_s16le", "channels": 1, "input_sample_rate": 16000},
             "features": {"client_tools": True, "response_schema": True,
                          "binary_websocket": False, "history": False,
-                         "delivery_reconciliation": False, "provisioning": False,
+                         "delivery_reconciliation": False, "provisioning": True,
                          "joint_resource_admission": False},
             "startup_error": self.startup_error,
         }
+
+    def visual_availability(self) -> dict[str, dict[str, Any]]:
+        """Return startup diagnostics without filesystem or Git checks on the loop."""
+        if (self._visual_diagnostics is not None and not self.config.shippable_only
+                and self.config.visual_config is not None):
+            return {kind: dict(diagnostic) for kind, diagnostic in self._visual_diagnostics.items()}
+        reason = ("Experimental visual generation is not shippable."
+                  if self.config.shippable_only else
+                  "Visual configuration is not configured."
+                  if self.config.visual_config is None else
+                  "Visual deployment has not been inspected.")
+        return {kind: {"state": "unavailable", "experimental": True, "reason": reason}
+                for kind in VISUAL_KINDS}
+
+    def _inspect_visual_availability(self) -> dict[str, dict[str, Any]]:
+        """Inspect once in a startup worker; missing workers do not fail text startup."""
+        status: dict[str, Any] = {"state": "unavailable", "experimental": True}
+        if self.config.shippable_only:
+            status["reason"] = "Experimental visual generation is not shippable."
+        elif self.config.visual_config is None:
+            status["reason"] = "Visual configuration is not configured."
+        else:
+            visual = getattr(self.facade, "visual", None)
+            if visual is not None:
+                try:
+                    available = visual.availability()
+                    if isinstance(available, dict):
+                        result = {}
+                        for kind in VISUAL_KINDS:
+                            diagnostic = available.get(kind, {})
+                            if not isinstance(diagnostic, dict):
+                                diagnostic = {}
+                            ready = (diagnostic.get("available") is True
+                                     or diagnostic.get("state") == "ready")
+                            result[kind] = {**status, **diagnostic,
+                                            "state": "ready" if ready else "unavailable"}
+                        return result
+                except Exception:
+                    pass
+            status["reason"] = "Visual deployment is unavailable."
+        return {kind: dict(status) for kind in VISUAL_KINDS}
 
     def require_ready(self) -> None:
         if self.state != "ready":
@@ -669,16 +747,42 @@ class _Runtime:
 
     def publish(self, pcm: bytes, sample_rate: int) -> dict[str, Any]:
         self.prune()
-        input_bytes = sum(len(job.input_pcm or b"") for job in self.jobs.values())
-        if (len(self.artifacts) >= 256
-            or self.artifact_bytes + input_bytes + len(pcm) > ARTIFACT_LIMIT):
-            raise ServiceError("RESOURCE_EXHAUSTED", "Artifact quota exhausted.", 429)
+        self.check_artifact_quota(len(pcm))
         identifier = str(uuid4())
         artifact = _Artifact(pcm, sample_rate)
         self.artifacts[identifier] = artifact
         self.artifact_bytes += len(pcm)
         return {"artifact_id": identifier, "sample_rate": sample_rate,
                 "sample_count": len(pcm) // 2, "sha256": artifact.sha256}
+
+    def check_artifact_quota(self, additional: int, *, new_artifact: bool = True) -> None:
+        input_bytes = sum(len(job.input_pcm or b"") + len(job.input_visual or b"")
+                          for job in self.jobs.values())
+        if ((new_artifact and len(self.artifacts) >= 256)
+            or self.artifact_bytes + input_bytes + additional > ARTIFACT_LIMIT):
+            raise ServiceError("RESOURCE_EXHAUSTED", "Artifact quota exhausted.", 429)
+
+    @staticmethod
+    def validate_visual(data: bytes, media_type: str) -> None:
+        if not data or len(data) > VISUAL_LIMIT:
+            raise ServiceError("INVALID_ARTIFACT", "Visual payload exceeds its bounds.")
+        from orchestrator.visual import validate_visual
+
+        try:
+            validate_visual(data, media_type)
+        except Exception as exc:
+            raise ServiceError("INVALID_ARTIFACT", "Invalid visual container.") from exc
+
+    def publish_visual(self, data: bytes, media_type: str) -> dict[str, Any]:
+        self.validate_visual(data, media_type)
+        self.prune()
+        self.check_artifact_quota(len(data))
+        identifier = str(uuid4())
+        artifact = _Artifact(data, 0, media_type=media_type)
+        self.artifacts[identifier] = artifact
+        self.artifact_bytes += len(data)
+        return {"artifact_id": identifier, "media_type": media_type,
+                "byte_length": len(data), "sha256": artifact.sha256}
 
     def submit(self, spec: JobSpec) -> _Job:
         self.require_ready()
@@ -693,9 +797,18 @@ class _Runtime:
                         "IDEMPOTENCY_CONFLICT", "Key was used for another request.", 409,
                     )
                 return prior
-        lane = spec.kind
-        if lane != "text" and self.config.profile != "voice":
-            raise ServiceError("UNSUPPORTED_KIND", "Voice profile is not configured.")
+        visual = spec.kind in VISUAL_KINDS
+        lane = "visual" if visual else spec.kind
+        if not visual and (
+            self.config.profile == "visual"
+            or (lane != "text" and self.config.profile != "voice")
+        ):
+            raise ServiceError("UNSUPPORTED_KIND", "Kind is not supported by this profile.")
+        if visual:
+            if self.config.shippable_only:
+                raise ServiceError("NOT_SHIPPABLE", "Visual generation is experimental.", 422)
+            if self.visual_availability()[spec.kind]["state"] != "ready":
+                raise ServiceError("VISUAL_UNAVAILABLE", "Visual deployment is unavailable.", 503)
         session = self.get_session(spec.session_id) if spec.session_id else None
         if spec.json_schema is not None and session and session.tools:
             raise ServiceError("INVALID_SPEC", "Tools and response schemas cannot be combined.")
@@ -712,19 +825,30 @@ class _Runtime:
         if active >= 16 or len(self.jobs) >= 256:
             raise ServiceError("RESOURCE_BUSY", "Job admission quota exhausted.", 429)
         pcm = None
+        visual_input = None
         if spec.input_artifact_id:
             artifact = self.artifacts.get(spec.input_artifact_id)
             if artifact is None:
                 raise ServiceError("ARTIFACT_NOT_FOUND", "Unknown or consumed artifact.", 404)
-            if artifact.sample_rate != 16000 or len(artifact.pcm) > PCM_LIMIT:
-                raise ServiceError("INVALID_SPEC", "STT requires bounded 16 kHz PCM input.")
-            pcm = artifact.pcm
+            if visual:
+                expected = "image/png" if spec.kind == "image_to_3d" else "model/gltf-binary"
+                if artifact.media_type != expected:
+                    raise ServiceError("INVALID_SPEC", "Visual input has the wrong media type.")
+                self.validate_visual(artifact.pcm, expected)
+                self.check_artifact_quota(len(artifact.pcm), new_artifact=False)
+                visual_input = memoryview(artifact.pcm).tobytes()
+            else:
+                if (artifact.media_type != "application/octet-stream"
+                        or artifact.sample_rate != 16000 or len(artifact.pcm) > PCM_LIMIT):
+                    raise ServiceError("INVALID_SPEC", "STT requires bounded 16 kHz PCM input.")
+                pcm = artifact.pcm
         job = _Job(str(uuid4()), spec, fingerprint,
-                   time.monotonic() + spec.deadline_ms / 1000, input_pcm=pcm)
+                   time.monotonic() + spec.deadline_ms / 1000, input_pcm=pcm,
+                   input_visual=visual_input)
         self.jobs[job.id] = job
         if spec.idempotency_key:
             self.idempotency[(spec.session_id, spec.idempotency_key)] = job.id
-        if spec.input_artifact_id:
+        if spec.input_artifact_id and not visual:
             consumed = self.artifacts.pop(spec.input_artifact_id)
             self.artifact_bytes -= len(consumed.pcm)
         self.queues[lane].put_nowait(job)
@@ -738,7 +862,7 @@ class _Runtime:
         # submit/cancel cycles could exhaust the bounded lane queue despite the
         # active admission count dropping to zero.
         if not job.host_pending:
-            lane = job.spec.kind
+            lane = "visual" if job.spec.kind in VISUAL_KINDS else job.spec.kind
             queue = self.queues[lane]
             retained = []
             while not queue.empty():
@@ -749,6 +873,7 @@ class _Runtime:
             for item in retained:
                 queue.put_nowait(item)
             job.input_pcm = None
+            job.input_visual = None
         job.state = "failed" if deadline else "cancelled"
         job.completed = time.monotonic()
         job.revision += 1
@@ -858,9 +983,54 @@ class _Runtime:
         await connection.emit("text.delta", {"text": text}, job)
 
     def infer(self, job: _Job) -> Any:
+        # The facade owns the reentrant GPU lock shared by in-process calls.
+        # Legacy offline fake text facades have no native resource to serialize.
+        lock = (getattr(self.facade, "_gpu_lock",
+                getattr(self.facade, "gpu_lock", nullcontext()))
+                if job.spec.kind == "text" or job.spec.kind in VISUAL_KINDS else nullcontext())
+        with lock:
+            if job.should_stop():
+                return None
+            if (job.spec.kind == "text" and hasattr(self.facade, "ensure_model")
+                    and not self.facade.text.loaded_model_id):
+                selected = self.diagnostics["actual"].get("text", {}).get("model_id")
+                self.facade.ensure_model(Modality.TEXT, model_id=selected or self.config.text_model)
+            return self._infer(job)
+
+    def _infer_visual(self, job: _Job) -> tuple[bytes, str]:
+        spec = job.spec
+        media_type = "image/png" if spec.kind == "image" else "model/gltf-binary"
+        with tempfile.TemporaryDirectory(prefix="echocradle-visual-") as directory:
+            root = Path(directory)
+            output = root / ("output.png" if spec.kind == "image" else "output.glb")
+            if spec.kind == "image":
+                self.facade.generate_image(
+                    spec.text, output, seed=spec.seed, negative_prompt=spec.negative_prompt,
+                    should_stop=job.should_stop,
+                )
+            else:
+                source = root / ("input.png" if spec.kind == "image_to_3d" else "input.glb")
+                source.write_bytes(job.input_visual or b"")
+                generate = (self.facade.generate_3d if spec.kind == "image_to_3d"
+                            else self.facade.animate_3d)
+                generate(source, output, seed=spec.seed, should_stop=job.should_stop)
+            if job.should_stop():
+                return b"", media_type
+            # Bound the read, even if a native worker produced an oversized file.
+            with output.open("rb") as handle:
+                data = handle.read(VISUAL_LIMIT + 1)
+            try:
+                self.validate_visual(data, media_type)
+            except ServiceError as exc:
+                raise ServiceError("INVALID_OUTPUT", "Invalid visual output.", 500) from exc
+            return data, media_type
+
+    def _infer(self, job: _Job) -> Any:
         if job.should_stop():
             return None
         spec = job.spec
+        if spec.kind in VISUAL_KINDS:
+            return self._infer_visual(job)
         if spec.kind == "text":
             registry = _RemoteRegistry(self, job)
             messages = list(spec.messages)
@@ -989,14 +1159,23 @@ class _Runtime:
                         except Exception:
                             pass
                         raise
+                    # Native inference has returned and no longer owns these buffers.
+                    # Publication must charge retained artifacts and other jobs, not
+                    # this completed input. Pending/cancelled natives keep theirs.
+                    job.input_pcm = None
+                    job.input_visual = None
                     if job.should_stop():
                         self.cancel_job(job, deadline=not job.cancel.is_set())
                     elif job.state not in TERMINAL:
-                        published = self.publish(*result) if name == "tts" else result
+                        if name == "visual":
+                            published = {**self.publish_visual(*result),
+                                         "seed": job.spec.seed, "experimental": True}
+                        else:
+                            published = self.publish(*result) if name == "tts" else result
                         try:
                             self.validate_success(job, published)
                         except ServiceError:
-                            if name == "tts":
+                            if name in ("tts", "visual"):
                                 artifact = self.artifacts.pop(published["artifact_id"])
                                 self.artifact_bytes -= len(artifact.pcm)
                             raise ServiceError("OUTPUT_LIMIT", "Result exceeds its wire budget.")
@@ -1007,6 +1186,8 @@ class _Runtime:
                         if name == "text" and job.spec.streaming:
                             await self.notify(job, "text.end", {"text": job.result["text"]})
                 except Exception as exc:
+                    if not isinstance(exc, ServiceError):
+                        log.exception("Local inference failed: kind=%s job=%s", job.spec.kind, job.id)
                     if job.state not in TERMINAL:
                         error = (exc if isinstance(exc, ServiceError) else
                                  ServiceError("HOST_FAILED", "Local inference failed.", 500))
@@ -1030,17 +1211,20 @@ class _Runtime:
                                 future.exception()
                             job.host_pending = False
                             job.input_pcm = None
+                            job.input_visual = None
                             job.revision += 1
 
                         native.add_done_callback(returned)
                     else:
                         job.host_pending = False
                         job.input_pcm = None
+                        job.input_visual = None
                     job.revision += 1
                     await self.notify(job, "job.state", self.job_snapshot(job))
             finally:
                 if job is not None and not job.host_pending:
                     job.input_pcm = None
+                    job.input_visual = None
                 queue.task_done()
 
     async def reaper(self) -> None:
@@ -1226,6 +1410,9 @@ def create_app(
     async def upload_artifact(request: Request) -> dict[str, Any]:
         if runtime.state in ("draining", "stopped"):
             raise ServiceError("NOT_READY", "The service is draining.", 503)
+        media_type = request.headers.get("content-type")
+        if media_type in ("image/png", "model/gltf-binary"):
+            return runtime.publish_visual(await request.body(), media_type)
         if request.headers.get("content-type") != "application/octet-stream":
             raise ServiceError("INVALID_CONTENT_TYPE", "Expected raw PCM octet-stream.", 415)
         if request.headers.getlist("x-sample-rate") != ["16000"]:
@@ -1242,12 +1429,14 @@ def create_app(
         artifact = runtime.artifacts.get(uuid_string(artifact_id))
         if artifact is None:
             raise ServiceError("ARTIFACT_NOT_FOUND", "Unknown or expired artifact.", 404)
-        return Response(artifact.pcm, media_type="application/octet-stream", headers={
-            "X-Sample-Rate": str(artifact.sample_rate),
-            "X-Sample-Count": str(len(artifact.pcm) // 2),
+        headers = {
             "X-Content-SHA256": artifact.sha256, "ETag": f'"{artifact.sha256}"',
             "Cache-Control": "no-store",
-        })
+        }
+        if artifact.media_type == "application/octet-stream":
+            headers.update({"X-Sample-Rate": str(artifact.sample_rate),
+                            "X-Sample-Count": str(len(artifact.pcm) // 2)})
+        return Response(artifact.pcm, media_type=artifact.media_type, headers=headers)
 
     @app.delete("/v1/artifacts/{artifact_id}")
     async def delete_artifact(artifact_id: str) -> dict[str, Any]:
@@ -1366,7 +1555,7 @@ def main(argv: list[str] | None = None) -> int:
     """Bind loopback, emit the sole bootstrap stdout line, then serve."""
     parser = argparse.ArgumentParser(description="EchoCradle cached-only local service")
     parser.add_argument("--port", type=int, default=0)
-    parser.add_argument("--profile", choices=("text", "voice"), default="text")
+    parser.add_argument("--profile", choices=("text", "voice", "visual"), default="text")
     parser.add_argument("--shippable-only", action="store_true")
     parser.add_argument("--text-model")
     parser.add_argument("--tts-model")
@@ -1374,6 +1563,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--speaker-id", type=int)
     parser.add_argument("--runtime-config", type=Path)
     parser.add_argument("--model-catalog", type=Path)
+    parser.add_argument("--visual-config", type=Path)
     args = parser.parse_args(argv)
     bootstrap = sys.stdout
     # All dependency/native prints and uvicorn/access logs go to stderr.
@@ -1397,20 +1587,36 @@ def main(argv: list[str] | None = None) -> int:
         app = create_app(config, token=token, store_lock=lock)
         # Keep access logs disabled: URLs are untrusted and may contain secrets
         # despite the protocol refusing URL-based authentication.
+        logging_config: dict[str, Any] = {
+            "version": 1, "disable_existing_loggers": False,
+            "formatters": {"default": {"format": "%(levelname)s: %(message)s"}},
+            "handlers": {"default": {"class": "logging.StreamHandler",
+                                     "stream": "ext://sys.stderr",
+                                     "formatter": "default"}},
+            "root": {"handlers": ["default"], "level": "INFO"},
+            "loggers": {"uvicorn": {"handlers": ["default"], "level": "INFO",
+                                     "propagate": False}},
+        }
+        diagnostic_path = os.environ.get("ECHOCRADLE_SERVICE_LOG")
+        if diagnostic_path:
+            # Trusted launcher environment only; never accept a request-supplied path.
+            # Capture this module, not access/native logs, headers, bodies or environment.
+            logging_config["formatters"]["diagnostic"] = {
+                "()": _ServiceLogFormatter, "token": token,
+            }
+            logging_config["handlers"]["diagnostic"] = {
+                "class": "logging.FileHandler", "filename": str(Path(diagnostic_path).resolve()),
+                "mode": "a", "encoding": "utf-8", "errors": "backslashreplace",
+                "formatter": "diagnostic",
+            }
+            logging_config["loggers"][log.name] = {
+                "handlers": ["default", "diagnostic"], "level": "INFO", "propagate": False,
+            }
         server = uvicorn.Server(uvicorn.Config(
             app, host="127.0.0.1", port=port, workers=1, access_log=False,
             ws_max_size=JSON_LIMIT, ws_max_queue=4, ws_per_message_deflate=False,
             timeout_keep_alive=5, timeout_graceful_shutdown=5, limit_concurrency=32,
-            log_config={
-                "version": 1, "disable_existing_loggers": False,
-                "formatters": {"default": {"format": "%(levelname)s: %(message)s"}},
-                "handlers": {"default": {"class": "logging.StreamHandler",
-                                         "stream": "ext://sys.stderr",
-                                         "formatter": "default"}},
-                "root": {"handlers": ["default"], "level": "INFO"},
-                "loggers": {"uvicorn": {"handlers": ["default"], "level": "INFO",
-                                         "propagate": False}},
-            },
+            log_config=logging_config,
         ))
         app.state.service.shutdown_callback = lambda: setattr(server, "should_exit", True)
         bootstrap.write(json.dumps({"port": port,

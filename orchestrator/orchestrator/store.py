@@ -4,19 +4,21 @@ Every experiment and the game resolve to the **same** directory (see
 :mod:`orchestrator.paths`), so a model is downloaded once and reused. The store
 never deletes anything on its own; eviction is a separate, explicit policy.
 
-Downloads are resumable-ish (we write to a ``.part`` file and rename on success)
-and verified by size, which is enough to catch a truncated transfer without
-pulling in a hashing dependency.
+Downloads use temporary files and atomic publication, not resumable transfers.
+Nonempty content and the HTTP Content-Length (when supplied) are checked; the
+catalog's rounded size_gb estimates are not integrity metadata or checksums.
 """
 
 from __future__ import annotations
 
 import shutil
 import tarfile
+import tempfile
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 from orchestrator.catalog import ModelDescriptor
 from orchestrator.errors import ModelDownloadError
@@ -54,7 +56,10 @@ class ModelStore:
             return target.is_file() and target.stat().st_size > 0
         if not target.is_dir():
             return False
-        return all((target / f).exists() for f in model.files)
+        return bool(model.files) and all(
+            (target / f).is_dir() or ((target / f).is_file() and (target / f).stat().st_size > 0)
+            for f in model.files
+        )
 
     def installed(self, model: ModelDescriptor) -> InstalledModel | None:
         if not self.is_installed(model):
@@ -92,7 +97,18 @@ class ModelStore:
         archive = self.root / f"{model.id}.download"
         self._fetch_file(model.url, archive, model.id, progress)
         try:
-            self._extract(archive, target)
+            with tempfile.TemporaryDirectory(prefix=".model-", dir=self.root) as temporary:
+                staged = Path(temporary) / "payload"
+                self._extract(archive, staged)
+                if not model.files or not all(
+                    (staged / f).is_dir()
+                    or ((staged / f).is_file() and (staged / f).stat().st_size > 0)
+                    for f in model.files
+                ):
+                    raise ModelDownloadError(f"{model.id}: required files are missing or empty")
+                if target.is_dir():
+                    shutil.rmtree(target)
+                staged.replace(target)
         finally:
             archive.unlink(missing_ok=True)
 
@@ -103,10 +119,15 @@ class ModelStore:
         label: str,
         progress: ProgressFn | None,
     ) -> None:
+        parsed = urlsplit(url)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username
+                or parsed.password or parsed.query or parsed.fragment):
+            raise ModelDownloadError(f"{label}: download requires an anonymous HTTPS URL")
         part = dest.with_suffix(dest.suffix + ".part")
         try:
             with urllib.request.urlopen(url, timeout=60) as response:
-                total = int(response.headers.get("Content-Length") or 0)
+                length = response.headers.get("Content-Length")
+                total = int(length) if length is not None else 0
                 done = 0
                 with part.open("wb") as handle:
                     while True:
@@ -117,13 +138,13 @@ class ModelStore:
                         done += len(chunk)
                         if progress:
                             progress(label, done, total)
-        except (OSError, urllib.error.URLError) as exc:
-            part.unlink(missing_ok=True)
+                if done == 0 or (length is not None and done != total):
+                    raise ModelDownloadError(f"{label}: empty or incomplete download")
+            part.replace(dest)
+        except (OSError, ValueError, urllib.error.URLError) as exc:
             raise ModelDownloadError(f"{label}: download failed: {exc}") from exc
-
-        if not part.exists() or part.stat().st_size == 0:
-            raise ModelDownloadError(f"{label}: downloaded file is empty")
-        part.replace(dest)
+        finally:
+            part.unlink(missing_ok=True)
 
     def _extract(self, archive: Path, target: Path) -> None:
         """Extract a ``.tar.bz2``/``.tar.gz`` archive, flattening one top dir."""

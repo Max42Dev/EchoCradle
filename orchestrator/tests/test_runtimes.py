@@ -13,8 +13,7 @@ import pytest
 from orchestrator.catalog import Catalog, Modality
 from orchestrator.hosts.text import TextHost
 from orchestrator.runtimes import RuntimeCatalog
-from orchestrator.service import CachedTextHost, ServiceConfig, _Runtime
-from orchestrator.service_protocol import ServiceError
+from orchestrator.service import ServiceConfig, _Runtime
 
 
 def write_runtime(path: Path, **changes: object) -> Path:
@@ -96,17 +95,14 @@ def test_provisioning_uses_configured_archives_and_executable(monkeypatch, tmp_p
     assert downloads == list(runtime.archives)
 
 
-def test_cached_host_never_downloads(monkeypatch, tmp_path: Path) -> None:
+def test_cached_host_reuses_nonempty_binary(monkeypatch, tmp_path: Path) -> None:
     runtime = RuntimeCatalog.from_json(write_runtime(tmp_path / "config.json")).get("llama.cpp")
     download = Mock()
     monkeypatch.setattr("orchestrator.hosts.text._download", download)
-    host = CachedTextHost(runtime=runtime, binary_dir=tmp_path / "binaries")
-    with pytest.raises(ServiceError) as error:
-        host._ensure_binary()
-    assert error.value.code == "MODEL_NOT_PROVISIONED"
+    host = TextHost(runtime=runtime, binary_dir=tmp_path / "binaries")
     host.binary_dir.mkdir()
     executable = host.binary_dir / runtime.executable
-    executable.touch()
+    executable.write_bytes(b"test executable")
     assert host._ensure_binary() == executable
     download.assert_not_called()
 

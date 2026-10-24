@@ -22,7 +22,7 @@ namespace EchoCradle.Orchestration
         /// (the directory containing orchestrator/service.py). Never downloads or installs models.
         /// </summary>
         public static Task<OwnedOrchestrator> StartAsync(string pythonExecutable, string packageRoot,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default, string profile = "voice", string visualConfig = null)
         {
             return Task.Run(async () =>
             {
@@ -44,7 +44,8 @@ namespace EchoCradle.Orchestration
                             rng.GetBytes(random);
                         token = Convert.ToBase64String(random);
                         Array.Clear(random, 0, random.Length);
-                        owner._process = WindowsOrchestratorProcess.Launch(pythonExecutable, packageRoot, token);
+                        owner._process = WindowsOrchestratorProcess.Launch(pythonExecutable, packageRoot, token,
+                            profile, visualConfig);
                         JObject bootstrap = await owner._process.BootstrapAsync(cancellationToken).ConfigureAwait(false);
                         OrchestratorWire.Integer(bootstrap["protocol_version"], 1, 1);
                         int port = OrchestratorWire.Integer(bootstrap["port"], 1, 65535);

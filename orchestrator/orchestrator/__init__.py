@@ -19,6 +19,7 @@ from orchestrator.client_types import (
         PcmCapability,
         TextResult,
         ToolOutcome,
+        VisualResult,
 )
 from orchestrator.conversation import Conversation
 from orchestrator.errors import (
@@ -63,6 +64,7 @@ __all__ = [
     "ToolOutcome",
     "ToolRegistry",
     "ToolSpec",
+    "VisualResult",
     "pick_input_device",
     "probe",
     "read_wav",

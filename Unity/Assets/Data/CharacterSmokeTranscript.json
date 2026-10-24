@@ -1,0 +1,12 @@
+{
+    "configuration": [
+        "My name is Mira. I want a colourful medieval fantasy world. Your companion name is Pip. Please record all three preferences.",
+        "I confirm: username Mira, style colourful medieval fantasy, ai_name Pip. Please record all of these."
+    ],
+    "descriptions": [
+        "My player character is an adult human female explorer with short auburn hair, green eyes, a blue tunic, brown trousers and leather boots. Full body, neutral standing pose. Please record this appearance."
+    ],
+    "rejectImages": 0,
+    "reviewSeconds": 2,
+    "timeoutSeconds": 5400
+}

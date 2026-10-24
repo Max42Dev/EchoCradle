@@ -11,7 +11,7 @@ using Newtonsoft.Json.Linq;
 namespace EchoCradle.Orchestration
 {
     /// <summary>Native protocol v1 transport. Callbacks are worker-thread callbacks, not Unity callbacks.</summary>
-    public sealed class OrchestratorClient : IDisposable
+    public sealed partial class OrchestratorClient : IDisposable
     {
         private readonly HttpClient _http;
         private readonly CancellationTokenSource _lifetime = new CancellationTokenSource();
@@ -154,13 +154,18 @@ namespace EchoCradle.Orchestration
 
         internal async Task<JObject> JsonAsync(HttpMethod method, string path, JObject payload,
             CancellationToken token, bool identity = false, bool allowUnready = false,
-            byte[] pcm = null)
+            byte[] pcm = null, byte[] binary = null, string mediaType = null)
         {
             HttpContent content = null;
             if (payload != null)
             {
                 content = new ByteArrayContent(OrchestratorWire.Encode(payload));
                 content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+            }
+            else if (binary != null)
+            {
+                content = new ByteArrayContent(binary);
+                content.Headers.ContentType = new MediaTypeHeaderValue(mediaType);
             }
             else if (pcm != null)
             {
@@ -300,14 +305,17 @@ namespace EchoCradle.Orchestration
         }
 
         internal async Task<JObject> RunJobAsync(JObject spec, CancellationToken token,
-            Action<string> submitted = null, Action checkSocket = null, bool returnTerminal = false)
+            Action<string> submitted = null, Action checkSocket = null, bool returnTerminal = false,
+            Func<Task> admittedAsync = null)
         {
             string id = null;
             bool terminal = false;
             bool rejected = false;
             JObject latest = null;
             var clock = System.Diagnostics.Stopwatch.StartNew();
-            int deadlineMs = OrchestratorWire.Integer(spec["deadline_ms"], 1000, 120000);
+            string kind = (string)spec["kind"];
+            bool visual = kind == "image" || kind == "image_to_3d" || kind == "animate_3d";
+            int deadlineMs = OrchestratorWire.Integer(spec["deadline_ms"], 1000, visual ? 3600000 : 120000);
             if (spec["idempotency_key"] == null) spec["idempotency_key"] = Guid.NewGuid().ToString("D");
             using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(token, Lifetime))
             {
@@ -322,6 +330,7 @@ namespace EchoCradle.Orchestration
                     lock (_sync) _jobs.Add(id);
                     MatchSpec(snapshot, spec);
                     submitted?.Invoke(id);
+                    if (admittedAsync != null) await admittedAsync().ConfigureAwait(false);
                     while (true)
                     {
                         deadline.Token.ThrowIfCancellationRequested();

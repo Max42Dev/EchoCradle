@@ -16,6 +16,8 @@ PROTOCOL_VERSION = 1
 JSON_LIMIT = 64 * 1024
 TOOL_LIMIT = 16 * 1024
 PCM_LIMIT = 960_000
+VISUAL_LIMIT = 32 * 1024 * 1024
+VISUAL_KINDS = frozenset({"image", "image_to_3d", "animate_3d"})
 ARTIFACT_LIMIT = 64 * 1024 * 1024
 TTL_SECONDS = 600
 TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
@@ -150,7 +152,7 @@ def session_spec(data: dict[str, Any]) -> list[dict[str, Any]]:
 
 @dataclass(frozen=True)
 class JobSpec:
-    kind: Literal["text", "tts", "stt"]
+    kind: Literal["text", "tts", "stt", "image", "image_to_3d", "animate_3d"]
     session_id: str | None = None
     turn_id: str | None = None
     messages: list[dict[str, str]] = field(default_factory=list)
@@ -162,10 +164,35 @@ class JobSpec:
     idempotency_key: str | None = None
     streaming: bool = False
     json_schema: dict[str, Any] | None = None
+    seed: int | None = None
+    negative_prompt: str = ""
 
     @classmethod
     def parse(cls, data: dict[str, Any]) -> JobSpec:
-        fields(data, set(cls.__dataclass_fields__), {"kind"})
+        if isinstance(data.get("kind"), str) and data["kind"] in VISUAL_KINDS:
+            kind = data["kind"]
+            allowed = {"kind", "seed", "deadline_ms", "idempotency_key"}
+            required = {"kind", "seed"}
+            if kind == "image":
+                allowed.update({"text", "negative_prompt"})
+                required.add("text")
+            else:
+                allowed.add("input_artifact_id")
+                required.add("input_artifact_id")
+            fields(data, allowed, required)
+            return cls(
+                kind=kind,
+                text=string(data["text"], 16_384, empty=False) if kind == "image" else None,
+                negative_prompt=string(data.get("negative_prompt", ""), 16_384),
+                seed=integer(data["seed"], 0, 2**32 - 1),
+                input_artifact_id=(uuid_string(data["input_artifact_id"])
+                                   if kind != "image" else None),
+                deadline_ms=integer(data.get("deadline_ms", 600_000), 1000, 3_600_000),
+                idempotency_key=(string(data["idempotency_key"], 128, empty=False)
+                                 if "idempotency_key" in data else None),
+            )
+        # New visual fields must not relax the existing text/audio parser.
+        fields(data, set(cls.__dataclass_fields__) - {"seed", "negative_prompt"}, {"kind"})
         kind = data["kind"]
         if kind not in ("text", "tts", "stt"):
             raise ServiceError("UNSUPPORTED_KIND", "Unsupported job kind.")

@@ -11,9 +11,13 @@ namespace EchoCradle.Interview
         [SerializeField, Tooltip("Prompts, schema, UI strings and local runtime settings.")]
         private TextAsset configuration;
 
+        [SerializeField, Tooltip("Dedicated schema and prompts for the NEW appearance conversation.")]
+        private TextAsset playerDescription;
+
         public JObject Read()
         {
             if (configuration == null) throw new InvalidOperationException("Missing interview configuration.");
+            if (playerDescription == null) throw new InvalidOperationException("Missing player description configuration. Assign the PlayerDescription TextAsset in InterviewSettings.");
             JObject data = OrchestratorWire.Decode(System.Text.Encoding.UTF8.GetBytes(configuration.text));
             // Reject unsafe timing/buffer values before starting devices or model jobs.
             JObject mic = (JObject)data["microphone"];
@@ -39,6 +43,10 @@ namespace EchoCradle.Interview
             float temperature = (float)data["generation"]["temperature"];
             Require(!float.IsNaN(temperature) && temperature >= 0 && temperature <= 2);
             Require(data["tools"] == null && data["schema"] is JObject && data["prompts"] is JObject && data["ui"] is JObject);
+            data["playerDescription"] = OrchestratorWire.Decode(System.Text.Encoding.UTF8.GetBytes(playerDescription.text));
+            Require(data["playerDescription"] is JObject);
+            var description = new InterviewState((JObject)data["playerDescription"]["schema"]);
+            Require(description.Missing().Count == 1 && (string)description.Missing()[0] == "description");
             return data;
         }
 

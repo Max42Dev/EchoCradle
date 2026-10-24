@@ -1,0 +1,8 @@
+{
+  "name": "EchoCradle.CharacterPreview.PlayModeTests",
+  "rootNamespace": "EchoCradle.CharacterPreview.Tests",
+  "references": ["EchoCradle.CharacterPreview"],
+  "optionalUnityReferences": ["TestAssemblies"],
+  "defineConstraints": ["UNITY_INCLUDE_TESTS"],
+  "autoReferenced": false
+}

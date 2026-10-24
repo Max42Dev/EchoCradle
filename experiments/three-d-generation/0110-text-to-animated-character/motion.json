@@ -1,0 +1,7 @@
+{
+    "id": "walk_forward",
+    "prompt": "A person walks forward naturally at a steady pace.",
+    "frames": 120,
+    "fps": 20,
+    "seed": 10107
+}

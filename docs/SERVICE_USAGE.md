@@ -1,6 +1,6 @@
 # Local service and voice experiment usage
 
-**Status:** implemented bounded slice, contract updated **2026-10-10**. Source of truth:
+**Status:** implemented bounded slice, provisioning updated **2026-10-24**. Source of truth:
 [`service.py`](../orchestrator/orchestrator/service.py),
 [`client.py`](../orchestrator/orchestrator/client.py) and
 [`service_protocol.py`](../orchestrator/orchestrator/service_protocol.py).
@@ -20,14 +20,15 @@ cd C:\projects\EchoCradle
 python -m pip install -e ".\orchestrator[all,dev]"
 ```
 
-This installs package dependencies, **not model weights or llama.cpp**. Runtime
-startup, capabilities and jobs never download models or runtime binaries. Have
-the selected models and `llama-server.exe` already installed in the shared store
+This installs package dependencies, **not model weights or llama.cpp**. Service
+startup automatically downloads missing selected text/speech weights and the
+configured llama.cpp runtime into the shared store
 (`%LOCALAPPDATA%\EchoCradle\models`; `ECHOCRADLE_HOME` overrides the root).
 The service uses an exclusive per-store writer lock; a second service using the
-same store fails with `STORE_BUSY`. Missing selected weights/runtime fail with
-`MODEL_NOT_PROVISIONED`; do not expect automatic selection of a cached substitute.
-Provisioning is not a service endpoint in this slice.
+same store fails with `STORE_BUSY`. Provisioning runs off the HTTP event loop;
+readiness waits for downloads and model loading. Failed provisioning fails startup
+with `STARTUP_FAILED`; there is no offline/cached-only option or separate
+provisioning endpoint. This does not provision the experimental visual stack.
 
 ### External configuration
 
@@ -42,9 +43,8 @@ Overrides replace the complete file and require a service restart.
 The default native runtime is pinned in `orchestrator/runtimes.json` to llama.cpp
 `b11471`, variant `win-cuda-12.4-x64`. Its cache is now
 `models/llama.cpp/b11471/win-cuda-12.4-x64/`, including executable and DLLs.
-Old flat version directories are not searched; relocate their complete extracted
-runtime files into the variant directory or provision it outside the service.
-Changing config does not provision assets; uncached selections still fail.
+Old flat version directories are not searched; missing variant deployments are
+downloaded automatically. Changed selections are provisioned on the next startup.
 See [configuration details](../orchestrator/README.md#external-model-and-runtime-configuration).
 
 Default catalog preferences, subject to licence, individual memory fit and
@@ -52,7 +52,7 @@ eligibility, are Granite `granite-4.2-8b-q4km`, Kokoro `kokoro-en-v0_19` (speake
 7, `bf_emma`) and SenseVoice `sensevoice-small`. SenseVoice is offline/final-only
 and **not marked shippable**. `--shippable-only` changes startup eligibility, not
 licence clearance for the development default. Any newly selected model must
-also already be cached. Microphone mode additionally needs the local cached
+be anonymously downloadable. Microphone mode additionally needs the local cached
 `silero-vad\silero_vad.onnx` and a working 16 kHz input device.
 
 ## Default: the experiment owns its service
@@ -84,10 +84,10 @@ Other launches from the same directory:
 # Typed replies, no TTS: starts only the text profile.
 python main.py --no-tts
 
-# Cached voice profile: starts/loads it, prints capabilities and closes it.
+# Voice profile: provisions/loads it, prints capabilities and closes it.
 python main.py --capabilities
 
-# Cached text profile only.
+# Text profile only; provisions missing text weights/runtime.
 python main.py --no-tts --capabilities
 
 # Typed replies with synthesized WAVs; playback is opt-in.
@@ -101,7 +101,8 @@ TTS is enabled by default, playback is disabled by default. `--no-tts` without
 `--mic`/`--stt-file` chooses `text`; otherwise the experiment chooses `voice`,
 which loads text, TTS and STT even if only one speech direction is needed.
 `--capabilities` is **not** a cold, probe-only command: client construction waits
-for the configured profile to load; it does not download anything.
+for the configured profile to provision and load. First launch needs network
+access for missing assets; existing deployments are reused.
 Default output is the experiment's `out/config.json`, with reply WAVs and
 `delivery.jsonl` alongside it. Use `--out` to choose another config file.
 
@@ -126,7 +127,8 @@ python -m orchestrator.service --port 5010 --profile voice
 
 The service prints one bootstrap JSON line (port, instance ID, protocol version),
 then logs to stderr. Bootstrap is not a readiness guarantee. There is one uvicorn
-process (`workers=1`), no reload, and three serialized worker lanes.
+process (`workers=1`), no reload, and four serialized worker lanes (text, TTS,
+STT and optional visual work).
 
 In another terminal with the **same environment token** supplied through a
 trusted local environment/secret mechanism, attach:
@@ -151,6 +153,14 @@ Programmatic `spawned_owner=False` denies shutdown, but there is no CLI flag for
 
 ## Implemented API (protocol version 1)
 
+Experimental cached character generation is also available: `image` →
+`image_to_3d` → `animate_3d`, with PNG/GLB artifact handoffs. Enable it with trusted
+server-owned `--visual-config` or owned-client `visual_config`; this is not a job
+field. See [visual API and Python examples](VISUAL_GENERATION_API.md) for the
+complete staged contract and remaining release limitations. Text/voice startup
+does not require visual workers. Shippable-only mode rejects these experimental
+stages, whose full licensing audit is incomplete.
+
 Every REST route and WebSocket upgrade requires `Authorization: Bearer ...`.
 Host must match the loopback listener; browser origins are rejected by default.
 JSON is UTF-8, capped at 64 KiB, with duplicate keys, non-finite values, excessive
@@ -160,7 +170,7 @@ depth and unknown spec fields rejected. No compatibility translation is provided
 | --- | --- |
 | `GET /v1/health/live` | Instance/protocol identity; not proof models are ready. |
 | `GET /v1/health/ready` | 200 when the entire configured profile is ready; otherwise 503, state and startup error. |
-| `GET /v1/capabilities` | Cached-only status, planned/actual models, kind readiness, limits and feature flags. No downloads. |
+| `GET /v1/capabilities` | Planned/actual models, kind readiness, limits; `cached_only=false`, `features.provisioning=true` for text/speech/runtime startup. Reading this route does not itself trigger downloads; visuals remain cached-only. |
 | `POST /v1/sessions` | 201; accepts only `tools` (native function declarations, default `[]`). Returns session ID/events path. |
 | `DELETE /v1/sessions/{id}` | Cancels session jobs and closes its socket. |
 | `POST /v1/jobs` | 202 after validation/quota admission; inference runs in a worker lane. |
@@ -270,8 +280,11 @@ with ServiceClient.start_owned(profile="text") as client:
 Use `ServiceClient.attach("http://127.0.0.1:5010")` to attach with the inherited
 environment token; an explicit `token` may instead come from a trusted secret
 source. Attachment never acquires process ownership or changes startup policy.
-`start_owned(profile="text" | "voice", ...)` waits for cached readiness and
-owns shutdown. Missing cached deployments fail, never provision.
+`start_owned(profile="text" | "voice", ...)` waits for automatic provisioning
+and readiness, and owns shutdown. Unity's `--text-only` launch selects `text`
+instead of `voice`, without speech jobs or audio-device initialization. The
+separate `visual` profile runs configured cached visual workers without loading
+text/speech; it does not provision them or the visual stack.
 
 `chat(messages, ...)`, `stream_chat(messages, on_text=..., ...)`,
 `chat_with_tools(messages, registry, ...)` and
@@ -381,8 +394,9 @@ unknown outcome.
 - The Python client API is synchronous/blocking despite remote worker execution;
   text callbacks/tools run on the calling thread, with independent socket-reader,
   heartbeat and cancellation threads. Do not call it on a UI/audio callback.
-- No server history/delivery reconciliation, provisioning, joint VRAM/RAM
-  admission, game telemetry or image/3D/music/SFX. Generic tools provide a
+- No server history/delivery reconciliation, automatic visual provisioning,
+  joint VRAM/RAM admission, game telemetry or music/SFX. Image/3D/animation are
+  opt-in cached experimental stages, not shipping-cleared features. Generic tools provide a
   validated client action boundary, not a durable gameplay/action ledger.
   Portfolio revision 1 is not proof of a jointly feasible portfolio.
 - STT receives completed audio and returns final text only, including when using

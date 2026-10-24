@@ -19,6 +19,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -73,10 +74,14 @@ class TextHost:
         if self._model and self._model.descriptor.id == model.descriptor.id:
             return
         self.unload()
+        if self.base_url is None:
+            try:
+                self._start_server(model)
+            except BaseException:
+                # Startup may have spawned a process before failing or being interrupted.
+                self.unload()
+                raise
         self._model = model
-        if self.base_url is not None:
-            return  # external server; nothing to start
-        self._start_server(model)
 
     def unload(self) -> None:
         if self._process is not None:
@@ -578,32 +583,46 @@ class TextHost:
 
     def _ensure_binary(self) -> Path:
         """Download and extract llama-server if it is not already present."""
-        exe = self.binary_dir / self.runtime.executable
-        cached = next(self.binary_dir.rglob(self.runtime.executable), None)
-        if cached is not None and cached.is_file():
+        cached = next((path for path in self.binary_dir.rglob(self.runtime.executable)
+                       if path.is_file() and path.stat().st_size > 0), None)
+        if cached is not None:
             return cached
-        self.binary_dir.mkdir(parents=True, exist_ok=True)
-        for url in self.runtime.archives:
-            archive = self.binary_dir / Path(url).name
-            _download(url, archive)
-            with zipfile.ZipFile(archive) as zf:
-                zf.extractall(self.binary_dir)
-            archive.unlink(missing_ok=True)
-        if not exe.exists():
-            # Some builds nest the binaries one level down.
-            found = next(self.binary_dir.rglob(self.runtime.executable), None)
+        # Publish only after *all* archives succeed. An executable extracted
+        # before a failed CUDA dependency download must not count as installed.
+        self.binary_dir.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=".runtime-", dir=self.binary_dir.parent,
+        ) as temporary:
+            staged = Path(temporary) / "payload"
+            staged.mkdir()
+            for url in self.runtime.archives:
+                archive = Path(temporary) / Path(url).name
+                _download(url, archive)
+                with zipfile.ZipFile(archive) as zf:
+                    zf.extractall(staged)
+                archive.unlink()
+            found = next((path for path in staged.rglob(self.runtime.executable)
+                          if path.is_file() and path.stat().st_size > 0), None)
             if found is None:
                 raise HostError(f"{self.runtime.executable} not found after extraction")
-            return found
-        return exe
+            relative = found.relative_to(staged)
+            if self.binary_dir.is_dir():
+                shutil.rmtree(self.binary_dir)
+            staged.replace(self.binary_dir)
+        return self.binary_dir / relative
 
 
 def _download(url: str, dest: Path) -> None:
     part = dest.with_suffix(dest.suffix + ".part")
     try:
         with urllib.request.urlopen(url, timeout=120) as response, part.open("wb") as out:
+            length = response.headers.get("Content-Length")
             shutil.copyfileobj(response, out, length=1 << 20)
-    except (OSError, urllib.error.URLError) as exc:
-        part.unlink(missing_ok=True)
+            done = out.tell()
+            if done == 0 or (length is not None and done != int(length)):
+                raise HostError(f"empty or incomplete download for {url}")
+        part.replace(dest)
+    except (OSError, ValueError, urllib.error.URLError) as exc:
         raise HostError(f"download failed for {url}: {exc}") from exc
-    part.replace(dest)
+    finally:
+        part.unlink(missing_ok=True)

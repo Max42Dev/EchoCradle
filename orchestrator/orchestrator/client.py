@@ -7,6 +7,7 @@ An attached service is never shut down or process-terminated by this client.
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import hashlib
 import os
@@ -35,8 +36,11 @@ from orchestrator.service_protocol import (
     JobSpec, ServiceError, decode, encode, envelope, uuid_string,
 )
 from orchestrator.client_types import (
-    Capabilities, Message, TextResult, ToolOutcome, ToolRegistry, freeze_json,
+    Capabilities, Message, TextResult, ToolOutcome, ToolRegistry, VisualResult, freeze_json,
 )
+
+
+_VISUAL_LIMIT = 32 * 1024 * 1024
 
 
 class ServiceClientError(OrchestratorError):
@@ -208,12 +212,14 @@ class ServiceClient:
         tts_model: str | None = None, stt_model: str | None = None,
         speaker_id: int | None = None, shippable_only: bool = False,
         vad_path: Path | str | None = None,
+        visual_config: Path | None = None,
     ) -> ServiceClient:
         """Start a cached-only service; missing deployments fail, never provision."""
         return cls(
             profile=profile, text_model=text_model, tts_model=tts_model,
             stt_model=stt_model, speaker_id=speaker_id,
             shippable_only=shippable_only, vad_path=vad_path,
+            visual_config=visual_config,
         )
 
     @classmethod
@@ -235,9 +241,12 @@ class ServiceClient:
         speaker_id: int | None = None,
         shippable_only: bool = False,
         vad_path: Path | str | None = None,
+        visual_config: Path | None = None,
     ) -> None:
-        if profile not in ("voice", "text"):
-            raise _failure("INVALID_CONFIG", "Profile must be voice or text.")
+        if profile not in ("voice", "text", "visual"):
+            raise _failure("INVALID_CONFIG", "Profile must be voice, text or visual.")
+        if url is None and profile == "visual" and visual_config is None:
+            raise _failure("INVALID_CONFIG", "Visual profile requires visual_config.")
         self._lock = threading.RLock()
         self._closing = threading.Event()
         self._closed = False
@@ -262,6 +271,7 @@ class ServiceClient:
                 self._token = secrets.token_urlsafe(32)
                 bootstrap = self._spawn(
                     profile, text_model, tts_model, stt_model, speaker_id, shippable_only,
+                    visual_config,
                 )
                 if bootstrap.get("protocol_version") != PROTOCOL_VERSION:
                     raise _failure("PROTOCOL_ERROR", "Unsupported bootstrap protocol.")
@@ -272,7 +282,7 @@ class ServiceClient:
                 self._url = f"http://127.0.0.1:{port}"
             else:
                 if any(value is not None for value in (
-                    text_model, tts_model, stt_model, speaker_id,
+                    text_model, tts_model, stt_model, speaker_id, visual_config,
                 )) or shippable_only:
                     raise _failure("INVALID_CONFIG", "Attached service owns model policy.")
                 self._url = self._validate_url(url or "")
@@ -309,11 +319,13 @@ class ServiceClient:
     def _spawn(
         self, profile: str, text_model: str | None, tts_model: str | None,
         stt_model: str | None, speaker_id: int | None, shippable_only: bool,
+        visual_config: Path | None = None,
     ) -> dict[str, Any]:
         command = [sys.executable, "-m", "orchestrator.service", "--profile", profile]
         for flag, value in (
             ("--text-model", text_model), ("--tts-model", tts_model),
             ("--stt-model", stt_model), ("--speaker-id", speaker_id),
+            ("--visual-config", visual_config.resolve() if visual_config is not None else None),
         ):
             if value is not None:
                 command.extend([flag, str(value)])
@@ -617,11 +629,17 @@ class ServiceClient:
     def _poll(
         self, job: dict[str, Any], *, deadline: float | None = None,
         cancellation: threading.Event | None = None, snapshot: bool = False,
+        expected_kind: str | None = None,
     ) -> dict[str, Any]:
         identifier = job["job_id"]
         deadline = deadline if deadline is not None else time.monotonic() + 120
         try:
             while True:
+                if expected_kind is not None and (
+                    job.get("kind") != expected_kind or job.get("job_id") != identifier
+                    or job.get("session_id") is not None or job.get("turn_id") is not None
+                ):
+                    raise _failure("PROTOCOL_ERROR", "Visual job identity mismatch.")
                 if job.get("state") in TERMINAL:
                     return job if snapshot else self._result(job)
                 if cancellation is not None and cancellation.is_set():
@@ -819,6 +837,150 @@ class ServiceClient:
                               deadline=deadline)
             except OrchestratorError:
                 pass
+
+    async def generate_image(
+        self, text: str, *, seed: int, negative_prompt: str = "",
+        deadline_ms: int = 600_000,
+    ) -> VisualResult:
+        """Generate an experimental PNG without blocking the event loop."""
+        return await self._visual_async(
+            {"kind": "image", "text": text, "seed": seed, "negative_prompt": negative_prompt,
+             "deadline_ms": deadline_ms},
+        )
+
+    async def generate_3d(
+        self, image: bytes | VisualResult, *, seed: int, deadline_ms: int = 600_000,
+    ) -> VisualResult:
+        """Generate a static GLB from PNG bytes or a retained PNG artifact."""
+        return await self._visual_async(
+            {"kind": "image_to_3d", "seed": seed, "deadline_ms": deadline_ms},
+            image, "image/png",
+        )
+
+    async def animate_3d(
+        self, mesh: bytes | VisualResult, *, seed: int, deadline_ms: int = 600_000,
+    ) -> VisualResult:
+        """Rig and animate GLB bytes or a retained GLB artifact."""
+        return await self._visual_async(
+            {"kind": "animate_3d", "seed": seed, "deadline_ms": deadline_ms},
+            mesh, "model/gltf-binary",
+        )
+
+    async def _visual_async(
+        self, spec: dict[str, Any], payload: bytes | VisualResult | None = None,
+        input_media_type: str | None = None,
+    ) -> VisualResult:
+        cancellation = threading.Event()
+        worker = asyncio.create_task(asyncio.to_thread(
+            self._visual_job, spec, payload, input_media_type, cancellation,
+        ))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # The worker still owns admission/polling and cleanup. In particular,
+            # cancellation during POST must not abandon a subsequently admitted job.
+            cancellation.set()
+            worker.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+            raise
+
+    @staticmethod
+    def _validate_visual_payload(payload: bytes, media_type: str) -> None:
+        from orchestrator.visual import validate_visual
+
+        if not isinstance(payload, bytes) or not 0 < len(payload) <= _VISUAL_LIMIT:
+            raise _failure("ARTIFACT_INVALID", "Expected 1..32 MiB of visual bytes.",
+                           phase="validation")
+        try:
+            validate_visual(payload, media_type)
+        except (OrchestratorError, ValueError):
+            raise _failure("ARTIFACT_INVALID", "Invalid visual container.",
+                           phase="validation") from None
+
+    def _visual_job(
+        self, spec: dict[str, Any], payload: bytes | VisualResult | None,
+        input_media_type: str | None,
+        cancellation: threading.Event,
+    ) -> VisualResult:
+        # Validate all arguments before upload. The placeholder is never sent.
+        validation = dict(spec)
+        if input_media_type is not None:
+            validation["input_artifact_id"] = str(uuid4())
+        try:
+            JobSpec.parse(validation)
+        except ServiceError as exc:
+            raise _failure(exc.code, exc.message, phase="validation") from None
+        deadline = time.monotonic() + spec["deadline_ms"] / 1000
+        if cancellation.is_set():
+            raise _failure("CANCELLED", "Visual operation cancelled.")
+        uploaded: str | None = None
+        if input_media_type is not None:
+            if isinstance(payload, VisualResult):
+                identifier = _identifier(payload.artifact_id)
+                if (payload.media_type != input_media_type
+                        or type(payload.byte_length) is not int
+                        or payload.byte_length != len(payload.payload)
+                        or payload.sha256 != hashlib.sha256(payload.payload).hexdigest()
+                        or type(payload.seed) is not int or not 0 <= payload.seed < 2 ** 32
+                        or payload.experimental is not True):
+                    raise _failure("ARTIFACT_INVALID", "Invalid input artifact descriptor.",
+                                   phase="validation")
+                self._validate_visual_payload(payload.payload, input_media_type)
+            else:
+                self._validate_visual_payload(payload, input_media_type)
+                artifact = self._request(
+                    "POST", "/v1/artifacts", content=payload,
+                    headers={"Content-Type": input_media_type}, deadline=deadline,
+                )
+                uploaded = identifier = _identifier(artifact.get("artifact_id"))
+            spec = {**spec, "input_artifact_id": identifier}
+        try:
+            job = self._submit(spec, deadline=deadline)
+        except ServiceClientError as exc:
+            # As with STT, uncertain admission must leave the input to server TTL.
+            if uploaded is not None and (
+                exc.phase == "validation" or (exc.phase == "request"
+                and exc.code not in ("HTTP_ERROR", "PROTOCOL_ERROR")
+                and exc.status is not None and (400 <= exc.status < 500
+                or (exc.status == 503 and exc.code == "NOT_READY")))
+            ):
+                self._visual_cleanup(uploaded, deadline)
+            raise
+        # Admission copies visual inputs into job-owned storage. Release only our
+        # temporary upload now, even if the host is still running or polling fails.
+        if uploaded is not None:
+            self._visual_cleanup(uploaded, deadline)
+        final = self._poll(
+            job, deadline=deadline, cancellation=cancellation, snapshot=True,
+            expected_kind=spec["kind"],
+        )
+        result = self._result(final)
+        media_type = "image/png" if spec["kind"] == "image" else "model/gltf-binary"
+        identifier = _identifier(result.get("artifact_id"))
+        length, digest = result.get("byte_length"), result.get("sha256")
+        if (result.get("media_type") != media_type or type(length) is not int
+                or not 0 < length <= _VISUAL_LIMIT or not isinstance(digest, str)
+                or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest)
+                or type(result.get("seed")) is not int or result["seed"] != spec["seed"]
+                or result.get("experimental") is not True):
+            raise _failure("ARTIFACT_INVALID", "Invalid visual artifact descriptor.")
+        self._request("GET", "/v1/health/live", identity=True, deadline=deadline)
+        raw, headers, status = self._response(
+            "GET", f"/v1/artifacts/{identifier}", limit=length, deadline=deadline,
+        )
+        self._request("GET", "/v1/health/live", identity=True, deadline=deadline)
+        if (status != 200 or len(raw) != length or hashlib.sha256(raw).hexdigest() != digest
+                or headers.get("x-content-sha256") != digest
+                or headers.get("content-type") != media_type):
+            raise _failure("ARTIFACT_INVALID", "Visual artifact integrity check failed.")
+        self._validate_visual_payload(raw, media_type)
+        # Unlike transient TTS audio, visual outputs are reusable stage artifacts.
+        return VisualResult(identifier, media_type, length, digest, result["seed"], True, raw)
+
+    def _visual_cleanup(self, identifier: str, deadline: float) -> None:
+        try:
+            self._request("DELETE", f"/v1/artifacts/{identifier}", deadline=deadline)
+        except OrchestratorError:
+            pass  # Retention TTL owns failed cleanup; preserve the primary outcome.
 
     def _synthesize_samples(self, sentence: str) -> tuple[np.ndarray, int]:
         """Whitespace-chunked TTS, bounded to 2400 characters / 120 seconds total."""

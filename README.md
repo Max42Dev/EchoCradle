@@ -39,14 +39,18 @@ Hub and follow **[Unity/README.md](Unity/README.md)**. It uses the local model
 orchestrator, supports microphone interruptions and saves validated JSON before
 exiting. Load game is not implemented yet.
 
-The shipped text/voice path uses llama.cpp and sherpa-onnx behind the cached-only
+The implemented text/voice path uses llama.cpp and sherpa-onnx behind the
 local service, not the vision table's Ollama authoring stack. See
 [orchestrator API](orchestrator/README.md) and
 [exact service usage](docs/SERVICE_USAGE.md). Python applications explicitly use
 `orchestrator.client.ServiceClient.start_owned(...)` or `attach(...)` on a worker;
 its synchronous API returns typed text/tool outcomes. The Unity transport is
-implemented and offline-tested. Image/3D/music/SFX serving, automatic provisioning
-and joint resource scheduling remain proposals, not shipped service features.
+implemented and offline-tested. Startup automatically provisions missing selected
+text/speech weights and the configured llama.cpp runtime. Unity's `--text-only`
+selects the text profile without speech/audio devices. Image/3D/animation serving
+is opt-in and experimental, requiring configured cached visual workers and weights;
+automatic visual provisioning, shipping clearance, music/SFX serving and joint
+resource scheduling remain unresolved.
 
 ## Skills
 

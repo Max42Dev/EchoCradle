@@ -89,6 +89,22 @@ class ToolOutcome:
 
 
 @dataclass(frozen=True)
+class VisualResult:
+    """Verified, reusable visual artifact; payload is detached immutable bytes."""
+
+    artifact_id: str
+    media_type: str
+    byte_length: int
+    sha256: str
+    seed: int
+    experimental: bool
+    payload: bytes
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "payload", bytes(self.payload))
+
+
+@dataclass(frozen=True)
 class TextResult:
     state: TerminalState
     text: str

@@ -126,12 +126,13 @@ namespace EchoCradle.Orchestration
             }
         }
 
-        internal static WindowsOrchestratorProcess Launch(string python, string root, string token)
+        internal static WindowsOrchestratorProcess Launch(string python, string root, string token,
+            string profile = "voice", string visualConfig = null)
         {
             if (Environment.OSVersion.Platform != PlatformID.Win32NT)
                 throw new OrchestratorException("WINDOWS_REQUIRED");
             var owner = new WindowsOrchestratorProcess();
-            try { owner.Create(python, root, token); return owner; }
+            try { owner.Create(python, root, token, profile, visualConfig); return owner; }
             catch (Exception)
             {
                 owner.Dispose();
@@ -139,11 +140,14 @@ namespace EchoCradle.Orchestration
             }
         }
 
-        private void Create(string python, string root, string token)
+        private void Create(string python, string root, string token, string profile, string visualConfig)
         {
             if (!Path.IsPathRooted(python) || !File.Exists(python) ||
                 !Path.IsPathRooted(root) || !File.Exists(Path.Combine(root, "orchestrator", "service.py")) ||
-                python.IndexOf('"') >= 0)
+                python.IndexOf('"') >= 0 ||
+                (profile != "voice" && profile != "text" && profile != "visual") ||
+                (profile == "visual" && visualConfig == null) ||
+                (visualConfig != null && (!Path.IsPathRooted(visualConfig) || !File.Exists(visualConfig))))
                 throw new OrchestratorException("INVALID_PROCESS_CONFIG");
             _job = CreateJobObject(IntPtr.Zero, null);
             var limits = new ExtendedLimits { Basic = new BasicLimits { Flags = 0x2000 } };
@@ -203,7 +207,7 @@ namespace EchoCradle.Orchestration
                     }
                 };
                 // CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW.
-                var command = new StringBuilder("\"" + python + "\" -m orchestrator.service --profile voice --port 0");
+                var command = new StringBuilder(BuildCommand(python, profile, visualConfig));
                 if (!CreateProcess(python, command, IntPtr.Zero, IntPtr.Zero, true,
                     0x08080404, environment, root, ref startup, out ProcessInfo info))
                     throw new OrchestratorException("OWNERSHIP_FAILED");
@@ -235,6 +239,27 @@ namespace EchoCradle.Orchestration
                     Marshal.FreeHGlobal(environment);
                 }
             }
+        }
+
+        internal static string BuildCommand(string python, string profile, string visualConfig)
+        {
+            string command = QuoteArgument(python) + " -m orchestrator.service --profile " +
+                QuoteArgument(profile) + " --port 0";
+            return visualConfig == null ? command : command + " --visual-config " + QuoteArgument(visualConfig);
+        }
+
+        private static string QuoteArgument(string value)
+        {
+            if (value == null || value.IndexOf('\0') >= 0) throw new OrchestratorException("INVALID_PROCESS_CONFIG");
+            var quoted = new StringBuilder("\"");
+            int slashes = 0;
+            foreach (char c in value)
+            {
+                if (c == '\\') { slashes++; continue; }
+                quoted.Append('\\', c == '"' ? slashes * 2 + 1 : slashes).Append(c);
+                slashes = 0;
+            }
+            return quoted.Append('\\', slashes * 2).Append('"').ToString();
         }
 
         internal async Task<JObject> BootstrapAsync(CancellationToken token)

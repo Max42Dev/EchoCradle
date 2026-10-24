@@ -13,3 +13,4 @@ MonoBehaviour:
   m_Name: InterviewSettings
   m_EditorClassIdentifier: EchoCradle.Runtime::EchoCradle.Interview.InterviewSettings
   configuration: {fileID: 4900000, guid: 86ce664831fca634398806695497cefc, type: 3}
+  playerDescription: {fileID: 4900000, guid: 3146ed381a794cb2be363e341e2abf90, type: 3}

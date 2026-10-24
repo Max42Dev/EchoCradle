@@ -3,8 +3,9 @@
 One local model service, with an engine-neutral Python `ServiceClient`, backed
 by the planner, shared store and host adapters. The **bounded first slice is
 implemented, with contract hardening as of 2026-10-10**: loopback REST jobs/artifacts and JSON WebSocket
-text/tool events. It starts from **cached models and runtime binaries only**;
-there are no automatic service downloads. The Python client is synchronous and
+text/tool events. Since **2026-10-24**, startup automatically provisions missing
+selected text/speech weights and the configured llama.cpp runtime; existing
+deployments are reused. Visual provisioning is not implemented. The Python client is synchronous and
 can block; use a worker for UI integration. The Unity client and interview
 prototype are implemented; see [Unity usage and validation](../Unity/README.md).
 The application entry point is `orchestrator.client.ServiceClient`, using explicit
@@ -24,18 +25,38 @@ See [service usage](../docs/SERVICE_USAGE.md) for exact commands and wire fields
 | Text host (llama.cpp) | ✅ verified end to end |
 | Speech hosts (sherpa-onnx TTS + online/offline STT) | ✅ real-model round trip; service returns final STT only |
 | Remote tools | ✅ arbitrary validated function declarations; implementations stay client-side |
-| Image / 3D / music / SFX hosts | ⬜ not yet |
+| Image / 3D / animation | ✅ experimental cached 0110 worker stages; no shipping clearance |
+| Music / SFX hosts | ⬜ not yet |
 | REST jobs/artifacts + JSON WebSocket; Python client | ✅ bounded first slice implemented |
 | Unity client / interview prototype | ✅ typed jobs/tool outcomes; offline boundary tests pass |
 | Binary WebSocket PCM / credits | ⬜ not yet |
-| Server history / delivery reconciliation / provisioning | ⬜ not yet (delivery ledger exists in Python experiment client) |
+| Text/speech weights + llama.cpp provisioning | ✅ automatic at profile startup, under the store writer lock; no offline option |
+| Visual stack provisioning | ⬜ not yet; configured cached workers only |
+| Server history / delivery reconciliation | ⬜ not yet (delivery ledger exists in Python experiment client) |
 | VRAM bin-packing scheduler | ⬜ not yet (one model per host) |
 
 [`docs/ORCHESTRATOR_SERVICE.md`](../docs/ORCHESTRATOR_SERVICE.md) remains the
 broader Unity **design reference**. Actual audio uses bounded PCM REST artifacts,
-not the proposed binary WebSocket transport. Three serialized worker lanes keep
+not the proposed binary WebSocket transport. Four serialized worker lanes keep
 blocking inference off the HTTP event loop; native speech crashes can still kill
-the whole service. Joint resource admission is not implemented.
+the whole service. Visual and text work share a GPU lock; text unloads before
+visual inference and reloads on the next text request. Joint resource admission
+is not implemented.
+
+## Experimental character generation
+
+The working `0110-text-to-animated-character` experiment now backs three staged
+jobs: `image`, `image_to_3d`, and `animate_3d`. Configure the existing cached
+deployment with `ServiceClient.start_owned(visual_config=Path(...))` or the
+service's `--visual-config` option. The async Python helpers `generate_image`,
+`generate_3d`, and `animate_3d` return immutable `VisualResult` objects containing
+verified PNG/GLB bytes and reusable artifact IDs.
+
+See [API contract and usage](../docs/VISUAL_GENERATION_API.md) for chaining,
+deadlines, cancellation and deployment limits. No visual model downloads occur. The
+full dependency/license audit remains incomplete, so these stages are rejected
+in shippable-only mode. Offline tests do not certify generated quality or Unity
+playback; no new real-model inference run is claimed by this integration.
 
 ## Model catalog
 
@@ -64,10 +85,10 @@ Horizon uses the existing `model_id` override in `ModelOrchestrator` or
 `text_model` in `ServiceClient`; the interview CLI accepts
 `--text-model k2-horizon-7b-q4km`. Granite remains the default. Direct
 `ModelOrchestrator.ensure_model` provisions the selected weights on demand into
-the same shared store. Service startup remains cached-only: provision first.
+the same shared store. Service startup also provisions missing selected assets.
 The shared text runtime is now pinned to llama.cpp **b11471**, required for
-Horizon support; this changes the runtime for Granite too and requires that
-build to be cached for service launches. Existing older cached builds are not
+Horizon support; this changes the runtime for Granite too and automatically
+provisions that build when missing. Existing older cached builds are not
 deleted. Horizon's native JSON tool format is configured in the catalog.
 See [the interview comparison](../docs/HORIZON_INTERVIEW_COMPARISON.md) for its
 tool-use limitations and the invalid player-agent benchmark caveat.
@@ -101,10 +122,8 @@ Do not select `latest`: runtime compatibility must be tested before deployment.
 
 Runtime binaries are cached under `models/<runtime-id>/<version>/<variant>/`.
 The variant subdirectory is new: existing flat `models/llama.cpp/b11471/` caches
-are **not** used. Re-provision, or manually relocate the already extracted runtime
-files into `models/llama.cpp/b11471/win-cuda-12.4-x64/` (including companion DLLs).
-The service remains cached-only and never downloads missing binaries or weights.
-Direct experiment hosts may provision the configured archives as before.
+are **not** used. The service automatically provisions missing variant deployments,
+including companion DLL archives, before publishing the complete runtime.
 
 These files are trusted operator configuration: runtime archives contain native
 executables. HTTPS/path validation does not establish publisher trust; only use
@@ -122,9 +141,10 @@ python -m pip install -e ".\orchestrator[speech]" # + sherpa-onnx, numpy, soundd
 python -m pip install -e ".\orchestrator[all,dev]" # service + text + speech + tests
 ```
 
-Dependencies are not weights or llama.cpp provisioning. The service requires
-already cached selected models and `llama-server.exe`; microphone mode also
-requires cached Silero VAD. Missing assets fail rather than trigger downloads.
+Installing dependencies does not fetch weights or llama.cpp. Service startup
+automatically provisions missing selected text/speech models and runtime binaries;
+microphone mode separately requires cached Silero VAD. Experimental visual workers,
+their environments and weights still require an existing configured deployment.
 
 ## The model store
 
@@ -152,7 +172,7 @@ python main.py --capabilities
 ```
 
 Each command automatically starts one contained owner service, waits for its
-cached profile and closes it on exit. `--capabilities` loads the profile; it is
+provisioned profile and closes it on exit. `--capabilities` provisions/loads the profile; it is
 not a cold probe. Startup model/speaker flags configure an owned service, not
 gameplay requests. For standalone port 5010, secure environment token generation,
 attached mode and smoke commands, see [service usage](../docs/SERVICE_USAGE.md).
@@ -204,9 +224,10 @@ for registry contracts, error metadata, deadlines and cleanup limitations.
 
 `ModelOrchestrator` remains the low-level synchronous host facade used by
 in-process diagnostics and benchmarks, **not the voice experiment launch path**.
-Its direct store/runtime setup may download missing assets; the service replaces
-those paths with cached-only adapters. Do not use direct host calls as service
-provisioning or a Unity integration entrypoint.
+Its direct store/runtime setup and service startup both provision missing selected
+text/speech assets. Use `ServiceClient`, not direct host calls, for Unity/application
+integration. Unity's `--text-only` selects the text profile without speech/audio;
+the separate visual-only service profile still requires cached visual deployment.
 
 ```python
 from orchestrator import ModelOrchestrator, Modality
@@ -269,7 +290,7 @@ request ──► Planner ──► ModelStore ──► RuntimeHost ──► a
 | `hosts/speech.py` | sherpa-onnx TTS, streaming and offline STT |
 | `orchestrator.py` | synchronous in-process host facade |
 | `service_protocol.py` | exact bounded JobSpec, envelopes and validated tool declarations |
-| `service.py` | cached-only profile, auth, REST/JSON WebSocket, jobs and worker lanes |
+| `service.py` | automatic text/speech/runtime provisioning, auth, REST/JSON WebSocket, jobs and worker lanes |
 | `client.py` | synchronous remote API, owned/attached lifecycle and PCM artifacts |
 | `client_types.py` | message/capability types, registry protocol, immutable text/tool outcomes |
 
@@ -320,7 +341,7 @@ the integration report will record final combined offline totals.
   return empty content. Recorded per model in the catalog.
 - **Bounded service, not the full Unity design.** PCM uses REST artifacts; there
   are no binary WebSocket credits, server history/delivery reconciliation,
-  or provisioning. The shipped Unity client uses the bounded REST/JSON transport;
+  or automatic visual provisioning. The shipped Unity client uses the bounded REST/JSON transport;
   remote tools are arbitrary validated declarations, not a `config_set` allowlist.
 - **Final-only service STT.** Offline SenseVoice has no partials; this client
   does not expose partials from online recognizers either.

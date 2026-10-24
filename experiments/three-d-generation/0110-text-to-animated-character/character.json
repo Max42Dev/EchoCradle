@@ -1,0 +1,12 @@
+{
+    "id": "courier_mira",
+    "description": "Mira is an adult human courier from EchoCradle's hill settlements. She has short chestnut hair, a teal fitted tunic, brown trousers and simple ankle boots. Her silhouette is slender and readable; she carries no equipment in the generation pose.",
+    "prompt": "one stylized adult human fantasy courier, short chestnut hair, teal fitted tunic, brown fitted trousers, simple ankle boots, slender proportional anatomy, full body neutral A-pose, straight legs separated, arms separated from torso, empty open hands, entire feet visible, front view, minimal perspective, centered with generous margins, isolated on plain white background, soft neutral lighting, clean game character reference, no ground shadow",
+    "negative_prompt": "portrait, cropped, multiple people, character sheet, extra limbs, missing limbs, fused arms, crossed legs, cloak, skirt, weapon, bag, straps, long hair, text, watermark, dramatic lighting, cast shadow",
+    "seed": 1102026,
+    "height_m": 1.7,
+    "width": 512,
+    "height": 768,
+    "steps": 24,
+    "guidance": 7.5
+}
