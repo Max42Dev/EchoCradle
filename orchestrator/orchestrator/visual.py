@@ -592,71 +592,71 @@ class VisualBackend:
             raise ValueError("seed must be an unsigned 32-bit integer")
         with self._lock:
             _stop(should_stop)
+            debug = None
+            debug_root = os.environ.get("ECHOCRADLE_VISUAL_DEBUG_DIR")
+            if debug_root:
+                root = Path(debug_root).resolve()
+                root.mkdir(parents=True, exist_ok=True)
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+                debug = Path(tempfile.mkdtemp(prefix=f"{stamp}-{stage}-", dir=root))
+            status, error = "failed", None
+            worker_count = 0
             try:
-                self._deployment(stage)
-            except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                raise VisualError(f"Visual stage unavailable: {exc}") from exc
-            output = Path(output).absolute()
-            output.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory(prefix=".visual-", dir=output.parent) as folder:
-                scratch = Path(folder).resolve()
-                debug = None
-                debug_root = os.environ.get("ECHOCRADLE_VISUAL_DEBUG_DIR")
-                if debug_root:
-                    root = Path(debug_root).resolve()
-                    root.mkdir(parents=True, exist_ok=True)
-                    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-                    debug = Path(tempfile.mkdtemp(prefix=f"{stamp}-{stage}-", dir=root))
-                env = self._environment(scratch, seed)
-                deadline = time.monotonic() + self._config.get("timeout_seconds", 600)
-                worker_count = 0
-
-                def run(command: list[str], cwd: Path | None = None) -> None:
-                    nonlocal worker_count
-                    _stop(should_stop)
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError("Visual stage deadline exceeded")
-                    worker_count += 1
-                    worker_env = env
-                    if debug is not None:
-                        worker_env = dict(env, PYTHONUNBUFFERED="1")
-                        worker_env["ECHOCRADLE_VISUAL_LOG"] = str(
-                            debug / f"worker-{worker_count:03d}"
-                        )
-                    _run_process(command, cwd=cwd or scratch, env=worker_env, timeout=remaining,
-                                 should_stop=should_stop)
-
-                status, error = "failed", None
                 try:
-                    artifact = build(scratch, run)
-                    media = "image/png" if stage == "image" else "model/gltf-binary"
-                    _read_visual(artifact, media)
-                    _stop(should_stop)
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError("Visual stage deadline exceeded")
-                    if debug is not None:
-                        # Preserve the final artifact too, before atomic publication moves it.
-                        shutil.copytree(scratch, debug / "scratch")
-                    artifact.replace(output)
-                    status = "success"
-                except BaseException as exc:
-                    status = "cancelled" if isinstance(exc, VisualCancelled) else "failed"
-                    # Never serialize commands, environment, exception text or tracebacks:
-                    # these can contain credentials. Actual worker failures are in the logs.
-                    error = {"type": type(exc).__name__}
-                    raise
-                finally:
-                    if debug is not None:
-                        try:
-                            if status != "success":
-                                shutil.copytree(scratch, debug / "scratch", dirs_exist_ok=True)
-                        finally:
-                            manifest = dict(stage=stage, seed=seed, status=status, error=error,
-                                            workers=worker_count)
-                            (debug / "manifest.json").write_text(
-                                json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-                            )
+                    self._deployment(stage)
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    raise VisualError(f"Visual stage unavailable: {exc}") from exc
+                output = Path(output).absolute()
+                output.parent.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryDirectory(prefix=".visual-", dir=output.parent) as folder:
+                    scratch = Path(folder).resolve()
+                    try:
+                        env = self._environment(scratch, seed)
+                        deadline = time.monotonic() + self._config.get("timeout_seconds", 600)
+
+                        def run(command: list[str], cwd: Path | None = None) -> None:
+                            nonlocal worker_count
+                            _stop(should_stop)
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise TimeoutError("Visual stage deadline exceeded")
+                            worker_count += 1
+                            worker_env = env
+                            if debug is not None:
+                                worker_env = dict(env, PYTHONUNBUFFERED="1")
+                                worker_env["ECHOCRADLE_VISUAL_LOG"] = str(
+                                    debug / f"worker-{worker_count:03d}"
+                                )
+                            _run_process(command, cwd=cwd or scratch, env=worker_env,
+                                         timeout=remaining, should_stop=should_stop)
+
+                        artifact = build(scratch, run)
+                        media = "image/png" if stage == "image" else "model/gltf-binary"
+                        _read_visual(artifact, media)
+                        _stop(should_stop)
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("Visual stage deadline exceeded")
+                        if debug is not None:
+                            # Snapshot before atomic publication moves the final artifact.
+                            shutil.copytree(scratch, debug / "scratch")
+                        artifact.replace(output)
+                        status = "success"
+                    finally:
+                        if debug is not None and status != "success":
+                            shutil.copytree(scratch, debug / "scratch", dirs_exist_ok=True)
+            except BaseException as exc:
+                status = "cancelled" if isinstance(exc, VisualCancelled) else "failed"
+                # Never serialize commands, environment, exception text or tracebacks:
+                # these can contain credentials. Preserve the chain for service logging.
+                error = {"type": type(exc).__name__}
+                raise
+            finally:
+                if debug is not None:
+                    manifest = dict(stage=stage, seed=seed, status=status, error=error,
+                                    workers=worker_count)
+                    (debug / "manifest.json").write_text(
+                        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+                    )
             return output
 
     def generate_image(self, text: str, output: Path, *, seed: int,

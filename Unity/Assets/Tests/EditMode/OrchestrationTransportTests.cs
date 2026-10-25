@@ -408,10 +408,16 @@ public sealed class OrchestrationTransportTests
             try
             {
                 Task<string> operation = client.TranscribeAsync(new byte[320], cancel.Token);
-                await service.Submitted.Task;
+                // A server-side POST signal is not proof the client has received its job ID.
+                // The first GET proves client admission.
+                Task admitted = service.JobPolled.Task;
+                Assert.That(await Task.WhenAny(admitted, operation, Task.Delay(5000)), Is.SameAs(admitted));
                 cancel.Cancel();
+                Assert.That(await Task.WhenAny(operation, Task.Delay(5000)), Is.SameAs(operation));
                 try { await operation; Assert.Fail("Expected cancellation."); }
                 catch (OperationCanceledException) { }
+                // Known-ID cancellation must finish its endpoint request before returning.
+                Assert.That(service.CancelObserved.Task.IsCompleted, Is.True);
                 Assert.That(service.Cancels, Is.GreaterThanOrEqualTo(1));
             }
             finally { await client.CloseAsync(); }
@@ -491,6 +497,8 @@ public sealed class OrchestrationTransportTests
         private readonly Task _loop;
         public readonly byte[] Pcm = { 1, 0, 2, 0 };
         public readonly TaskCompletionSource<bool> Submitted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        public readonly TaskCompletionSource<bool> JobPolled = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        public readonly TaskCompletionSource<bool> CancelObserved = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         public readonly TaskCompletionSource<bool> ArtifactRead = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         public string Url { get; }
         public bool Reject, RejectJobs, BadDigest, Pending, UploadValid, BadAuthorization;
@@ -652,8 +660,15 @@ public sealed class OrchestrationTransportTests
                         response.StatusCode = 202;
                         Submitted.TrySetResult(true);
                     }
-                    else if (path.EndsWith("/cancel")) { Cancels++; _state = "cancelled"; body = Snapshot(); }
-                    else if (path.StartsWith("/v1/jobs/")) body = Snapshot();
+                    else if (path.EndsWith("/cancel"))
+                    {
+                        Cancels++; _state = "cancelled"; body = Snapshot();
+                        CancelObserved.TrySetResult(true);
+                    }
+                    else if (path.StartsWith("/v1/jobs/"))
+                    {
+                        body = Snapshot();
+                    }
                     else if (path == "/v1/artifacts")
                     {
                         using (var input = new MemoryStream())
@@ -691,6 +706,8 @@ public sealed class OrchestrationTransportTests
                     response.ContentLength64 = raw.Length;
                     await response.OutputStream.WriteAsync(raw, 0, raw.Length);
                     response.Close();
+                    if (request.HttpMethod == "GET" && path == "/v1/jobs/" + _job)
+                        JobPolled.TrySetResult(true);
                     if (path == "/v1/jobs" && response.StatusCode == 202 && (string)_spec?["kind"] == "text") await StartTextAsync();
                 }
             }

@@ -41,9 +41,11 @@ def model(**changes: object) -> ModelDescriptor:
     })
 
 
-@pytest.mark.parametrize("profile", ["text", "voice"])
+@pytest.mark.parametrize("profile,vad_cache", [
+    ("text", "missing"), ("voice", "missing"), ("voice", "cached"), ("voice", "empty"),
+])
 def test_default_startup_provisions_under_lock_off_loop_and_reuses_cache(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, profile: str,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, profile: str, vad_cache: str,
 ) -> None:
     async def run() -> None:
         main_thread = threading.get_ident()
@@ -66,6 +68,17 @@ def test_default_startup_provisions_under_lock_off_loop_and_reuses_cache(
         monkeypatch.setattr(lock, "acquire", acquire_lock)
         monkeypatch.setattr(lock, "release", release_lock)
         descriptors = [model()]
+        vad = Catalog.default().get("silero-vad")
+        assert vad.single_file and vad.is_cpu_only and vad.shippable
+        assert vad.url == (
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+            "asr-models/silero_vad.onnx"
+        )
+        descriptors.append(vad)
+        vad_path = tmp_path / "silero-vad" / "silero_vad.onnx"
+        if vad_cache != "missing":
+            vad_path.parent.mkdir()
+            vad_path.write_bytes(b"cached-vad" if vad_cache == "cached" else b"")
         for modality in (Modality.TTS, Modality.STT):
             descriptors.append(model(
                 id=modality.value, modality=modality, single_file=False,
@@ -95,6 +108,9 @@ def test_default_startup_provisions_under_lock_off_loop_and_reuses_cache(
 
         monkeypatch.setattr("orchestrator.orchestrator.TtsHost", Speech)
         monkeypatch.setattr("orchestrator.orchestrator.SttHost", Speech)
+        monkeypatch.setattr("orchestrator.orchestrator.ModelOrchestrator.create_vad", Mock(
+            side_effect=AssertionError("provisioning must not load a native VAD detector"),
+        ))
 
         def start_server(host: TextHost, installed: object) -> None:
             assert lock._file is not None
@@ -144,7 +160,17 @@ def test_default_startup_provisions_under_lock_off_loop_and_reuses_cache(
             assert runtime.state == "ready", runtime.startup_error
             assert type(runtime.facade.store) is ModelStore
             assert type(runtime.facade.text) is TextHost
-            assert len(downloads) == (5 if profile == "voice" else 3)
+            needs_vad = profile == "voice" and vad_cache != "cached"
+            assert len(downloads) == (5 if profile == "voice" else 3) + int(needs_vad)
+            assert downloads.count(vad.url) == int(needs_vad)
+            if profile == "voice":
+                assert vad_path.read_bytes() == (
+                    b"cached-vad" if vad_cache == "cached" else b"weights"
+                )
+                assert runtime.facade.catalog.get("silero-vad") is vad
+                assert runtime.facade.stt.loaded_model_id == "stt"
+            else:
+                assert not vad_path.exists()
             original_downloads = list(downloads)
             # Visual eviction followed by text use reloads the originally selected
             # model under the same writer ownership, without downloading again.
@@ -160,6 +186,71 @@ def test_default_startup_provisions_under_lock_off_loop_and_reuses_cache(
             proceed.set()
             await runtime.stop()
         assert events[-1] == "release" and lock._file is None
+        if profile == "voice":
+            restarted = _Runtime(ServiceConfig(profile=profile, store_root=tmp_path), None, lock)
+            await restarted.start()
+            try:
+                await asyncio.wait_for(restarted.startup_task, 3)
+                assert restarted.state == "ready", restarted.startup_error
+                assert downloads == original_downloads
+            finally:
+                await restarted.stop()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("shippable", [True, False])
+def test_voice_vad_failure_prevents_readiness_and_releases_writer_lock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, shippable: bool,
+) -> None:
+    async def run() -> None:
+        lock = StoreWriterLock(tmp_path)
+        events = []
+        vad = replace(Catalog.default().get("silero-vad"), shippable=shippable)
+        release = lock.release
+
+        def release_lock() -> None:
+            events.append("release")
+            release()
+
+        def stop() -> None:
+            assert lock._file is not None
+            events.append("stop")
+
+        def urlopen(url: str, **kwargs: object) -> Response:
+            assert lock._file is not None
+            assert url == vad.url
+            events.append("download-failed")
+            raise urllib.error.URLError("private URL details")
+
+        def factory(**kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                catalog=Catalog([vad]), store=kwargs["store"], runtimes=kwargs["runtimes"],
+                _hosts={}, stop=stop, report=ProbeReport(ram_gb=16),
+            )
+
+        monkeypatch.setattr(lock, "release", release_lock)
+        fetch = Mock(side_effect=urlopen)
+        monkeypatch.setattr("urllib.request.urlopen", fetch)
+        monkeypatch.setattr("orchestrator.orchestrator.ModelOrchestrator", factory)
+        runtime = _Runtime(ServiceConfig(
+            profile="voice", store_root=tmp_path, shippable_only=True,
+        ), None, lock)
+        await runtime.start()
+        try:
+            await asyncio.wait_for(runtime.startup_task, 2)
+            assert runtime.state == "failed"
+            assert runtime.startup_error["code"] == (
+                "STARTUP_FAILED" if shippable else "NOT_SHIPPABLE"
+            )
+            assert "private" not in str(runtime.startup_error)
+            assert events == (["download-failed"] if shippable else []) + ["stop", "release"]
+            assert fetch.call_count == int(shippable)
+            assert lock._file is None and runtime.facade is None
+            assert not (tmp_path / "silero-vad" / "silero_vad.onnx").exists()
+            assert not list(tmp_path.rglob("*.part"))
+        finally:
+            await runtime.stop()
 
     asyncio.run(run())
 

@@ -48,8 +48,12 @@ public sealed class CharacterCreationFlowTests
     [Test]
     public void Completion_UnrequestedCancellationAndRemoteCancelledJobAreErrors()
     {
-        Assert.ThrowsAsync<OperationCanceledException>(async () =>
-            await AwaitTurn(Task.FromException<OrchestratorJob>(new OperationCanceledException())));
+        Assert.That(async () =>
+            await AwaitTurn(Task.FromException<OrchestratorJob>(new OperationCanceledException())),
+            Throws.InstanceOf<OperationCanceledException>());
+        Assert.That(async () =>
+            await AwaitTurn(Task.FromCanceled<OrchestratorJob>(new CancellationToken(true))),
+            Throws.InstanceOf<OperationCanceledException>());
         Assert.ThrowsAsync<InvalidOperationException>(async () => await AwaitTurn(Task.FromResult(Job("cancelled"))));
         Assert.ThrowsAsync<InvalidOperationException>(async () => await AwaitTurn(Task.FromResult(Job("failed"))));
     }

@@ -294,6 +294,60 @@ def test_image_command_offline_and_cleanup(backend, runner, tmp_path):
     assert not list(tmp_path.glob(".visual-*"))
 
 
+@pytest.mark.parametrize("debug_enabled", [False, True])
+@pytest.mark.parametrize("failure", ["git_missing", "git_failed", "preflight", "config",
+                                    "output_parent", "scratch"])
+def test_early_failure_diagnostics(
+    backend, runner, tmp_path, monkeypatch, debug_enabled: bool, failure: str,
+) -> None:
+    root = tmp_path / "debug"
+    if debug_enabled:
+        monkeypatch.setenv("ECHOCRADLE_VISUAL_DEBUG_DIR", str(root))
+    secret = "private-token-must-not-be-serialized"
+    out = tmp_path / "result.glb"
+    out.write_bytes(b"previous")
+    cause_type = ValueError
+    expected_type = "VisualError"
+    if failure.startswith("git"):
+        cause_type = (FileNotFoundError if failure == "git_missing"
+                      else visual.subprocess.CalledProcessError)
+        error = (FileNotFoundError(secret) if failure == "git_missing"
+                 else visual.subprocess.CalledProcessError(1, ["git", secret], output=secret))
+        monkeypatch.setattr(visual.subprocess, "check_output", Mock(side_effect=error))
+    elif failure == "preflight":
+        (tmp_path / "tripo_model/model.ckpt").unlink()
+    elif failure == "config":
+        backend = VisualBackend(tmp_path / "missing.json")
+    elif failure == "output_parent":
+        out = out / "result.glb"  # Parent is an existing file.
+        expected_type = "FileExistsError"
+    else:
+        monkeypatch.setattr(visual.tempfile, "TemporaryDirectory",
+                            Mock(side_effect=PermissionError(secret)))
+        expected_type = "PermissionError"
+    before = set(tmp_path.rglob("*"))
+    with pytest.raises((VisualError, OSError)) as caught:
+        backend.generate_3d(tmp_path / "unused.png", out, seed=42)
+    if expected_type == "VisualError":
+        assert isinstance(caught.value.__cause__, cause_type)
+        assert "Visual stage unavailable" in str(caught.value)
+    assert not runner
+    assert (tmp_path / "result.glb").read_bytes() == b"previous"
+    if debug_enabled:
+        debug, = root.iterdir()
+        assert "-image_to_3d-" in debug.name
+        manifest_text = (debug / "manifest.json").read_text()
+        assert json.loads(manifest_text) == {
+            "stage": "image_to_3d", "seed": 42, "status": "failed",
+            "error": {"type": expected_type}, "workers": 0,
+        }
+        assert secret not in manifest_text
+        assert set(debug.iterdir()) == {debug / "manifest.json"}
+    else:
+        assert set(tmp_path.rglob("*")) == before
+    assert not list(tmp_path.glob(".visual-*"))
+
+
 @pytest.mark.parametrize("outcome", ["success", "failure", "cancelled", "invalid", "timeout"])
 def test_debug_preserves_complete_scratch_and_safe_manifest(
     backend, tmp_path, monkeypatch, outcome,

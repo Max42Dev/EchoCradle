@@ -1,7 +1,13 @@
 {
-  "name": "EchoCradle.TestHarness",
-  "includePlatforms": ["Editor"],
-  "overrideReferences": true,
-  "precompiledReferences": ["nunit.framework.dll"],
-  "optionalUnityReferences": ["TestAssemblies"]
+    "name": "EchoCradle.TestHarness",
+    "includePlatforms": [
+        "Editor"
+    ],
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "nunit.framework.dll"
+    ],
+    "optionalUnityReferences": [
+        "TestAssemblies"
+    ]
 }

@@ -1,5 +1,29 @@
 # Character creation checkpoint — 2026-10-24
 
+## Follow-up validation — 2026-10-25
+
+- Ordinary Unity NUnit tests now pass: **110 passed, 0 failed, 2 explicit skipped**.
+  Admission-aware cancellation tests retain endpoint assertions; native paths resolve
+  relative to the Unity project before integration checks.
+- Python suite after VAD provisioning and early visual diagnostics: **618 passed**.
+- Voice startup now automatically prepares the Silero VAD model at Unity's expected
+  shared-store path. Physical microphone/STT playback acceptance remains separate.
+- Trusted visual debug capture now records failures before deployment preflight or
+  scratch setup, so a failure cannot disappear merely because no worker launched.
+- Fresh real player run `Unity/Logs/character-smoke-v4` **completed successfully**:
+  configuration, description, image rejection, changed description, approved image,
+  static import, all five named animation previews and final ready save. Screenshots
+  and result.json are indexed by its local README. All four persisted artifact
+  SHA-256 values were independently verified. Test player/workers were stopped.
+- The smoke proves rendered previews and review progression, not natural motion or
+  evaluated deformation at every frame. Physical speech hardware remains untested.
+- Static preview is upright but currently side-facing; automatic front-facing
+  orientation and natural-pose quality are not certified.
+
+The historical results below describe the pushed checkpoint, not the current
+regression counts. The original intermittent failure is not root-caused merely
+because a fresh run progressed past reconstruction.
+
 ## Implemented
 
 - New appearance conversation after the original configuration interview.

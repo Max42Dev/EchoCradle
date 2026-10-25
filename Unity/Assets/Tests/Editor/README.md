@@ -23,12 +23,12 @@ result tree, including failure stacks and explicit skip reasons. The editor exit
 (harness errors use 2). Each run overwrites the XML; check the corresponding log
 for compilation/harness errors and the XML timestamp before consuming results.
 
-Verified 2026-10-24, Unity 6000.6.3f1:
+Verified 2026-10-25, Unity 6000.6.3f1:
 
-- 112 discovered: **106 passed, 4 failed, 2 explicit skipped**; editor exit 1.
+- 112 discovered: **110 passed, 0 failed, 2 explicit skipped**; editor exit 0.
 - Real native GameObject/controller lifecycle test passed.
-- Failures: cancellation exact exception type (`TaskCanceledException` versus
-  `OperationCanceledException`); unprovisioned native Silero VAD; text cancellation
-  endpoint not observed; visual cancellation endpoint not observed.
-- Both `RealOrchestratorTests` remain explicit and skipped. No model generation
-  was started. Existing player PID 4360 was left running.
+- Cancellation tests now wait for confirmed client admission/status before cancelling;
+  cancellation endpoint assertions remain enforced. Cancellation-subtype handling and
+  relative native VAD deployment paths are covered.
+- Both `RealOrchestratorTests` remain explicit and skipped. This diagnostic test run
+  starts no model generation and does not certify the separate live player flow.

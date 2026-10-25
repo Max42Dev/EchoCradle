@@ -109,9 +109,20 @@ public sealed class InterviewTests
     public async Task Silero_CachedNativeRuntimeProcessesSilenceOffMainThread()
     {
         JObject config = Configuration();
+        JObject vad = (JObject)config["vad"];
+        string projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
+        string directory = InterviewLaunchOptions.Resolve(projectRoot, (string)vad["nativeDirectory"]);
+        string model = InterviewLaunchOptions.Resolve(projectRoot, (string)vad["model"]);
+        vad["nativeDirectory"] = directory;
+        vad["model"] = model;
+        Assert.That(Path.IsPathRooted(directory) && Path.IsPathRooted(model), Is.True,
+            "Native VAD integration requires absolute resolved deployment paths.");
+        if (!File.Exists(model) || !File.Exists(Path.Combine(directory, "sherpa-onnx-c-api.dll")))
+            Assert.Ignore("Native Silero integration deployment absent (model or sherpa-onnx-c-api.dll). " +
+                "No inference was validated. Automatic product VAD provisioning remains separate pending work.");
         await Task.Run(() =>
         {
-            using (var detector = new SileroDetector((JObject)config["vad"]))
+            using (var detector = new SileroDetector(vad))
             {
                 detector.SetNoiseFloor(0.004);
                 for (int i = 0; i < 100; i++) Assert.That(detector.Process(new float[320]), Is.False);

@@ -29,7 +29,7 @@ import tempfile
 import threading
 import time
 from contextlib import asynccontextmanager, nullcontext
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -545,6 +545,14 @@ class _Runtime:
         diagnostics = {"probe": self.facade.report.to_dict(), "planned": {}, "actual": {}}
         selected = [(Modality.TEXT, self.config.text_model)]
         if self.config.profile == "voice":
+            if self.state == "draining":
+                raise ServiceError("CANCELLED", "Startup cancelled.", 503)
+            vad = self.facade.catalog.get("silero-vad")
+            if self.config.shippable_only and not vad.shippable:
+                raise ServiceError("NOT_SHIPPABLE", "Voice activity model is not shippable.", 422)
+            # Auxiliary CPU model, not an STT candidate. Keep the raw-file
+            # descriptor local so the cache matches Unity and ServiceClient.
+            self.facade.store.ensure(replace(vad, id=f"{vad.id}/silero_vad.onnx"))
             selected.extend([(Modality.TTS, self.config.tts_model),
                              (Modality.STT, self.config.stt_model)])
         for modality, model_id in selected:

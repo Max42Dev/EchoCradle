@@ -161,10 +161,16 @@ public sealed class VisualTransportTests
         using (var stop = new CancellationTokenSource())
         {
             Task<OrchestratorVisualResult> task = client.Generate3DAsync(Png, 8, token: stop.Token);
-            await server.Admitted.Task;
+            // Polling starts only after client admission and the awaited input release.
+            Task admitted = server.JobPolled.Task;
+            Assert.That(await Task.WhenAny(admitted, task, Task.Delay(5000)), Is.SameAs(admitted));
+            Assert.That(server.InputReleased.Task.IsCompleted, Is.True);
+            Assert.That(server.Deletes, Is.EqualTo(new[] { server.InputId }));
             stop.Cancel();
+            Assert.That(await Task.WhenAny(task, Task.Delay(5000)), Is.SameAs(task));
             try { await task; Assert.Fail("Expected cancellation."); }
             catch (OperationCanceledException) { }
+            Assert.That(server.CancelObserved.Task.IsCompleted, Is.True);
             Assert.That(server.Cancels, Is.GreaterThanOrEqualTo(1));
             Assert.That(server.Deletes, Is.EqualTo(new[] { server.InputId }));
         }
@@ -212,6 +218,9 @@ public sealed class VisualTransportTests
         internal readonly List<string> Deletes = new List<string>();
         internal readonly List<string> Events = new List<string>();
         internal readonly TaskCompletionSource<bool> Admitted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal readonly TaskCompletionSource<bool> JobPolled = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal readonly TaskCompletionSource<bool> CancelObserved = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal readonly TaskCompletionSource<bool> InputReleased = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         internal string Url, Fault, UploadMedia, UploadSampleRate;
         internal JObject Spec;
         internal byte[] Upload;
@@ -314,12 +323,23 @@ public sealed class VisualTransportTests
                             }
                             else { Events.Add("admit"); result = Snapshot(); status = 202; }
                         }
-                        else if (path.EndsWith("/cancel", StringComparison.Ordinal)) { Cancels++; result = Snapshot(); }
-                        else if (path.StartsWith("/v1/jobs/", StringComparison.Ordinal)) result = Snapshot();
+                        else if (path.EndsWith("/cancel", StringComparison.Ordinal))
+                        {
+                            Cancels++; result = Snapshot();
+                            CancelObserved.TrySetResult(true);
+                        }
+                        else if (path.StartsWith("/v1/jobs/", StringComparison.Ordinal))
+                        {
+                            result = Snapshot();
+                        }
                         else if (method == "DELETE")
                         {
                             string id = path.Substring(path.LastIndexOf('/') + 1); Deletes.Add(id);
-                            if (id == InputId) Events.Add("delete-input");
+                            if (id == InputId)
+                            {
+                                Events.Add("delete-input");
+                                InputReleased.TrySetResult(true);
+                            }
                             result = new JObject { ["artifact_id"] = id, ["state"] = "deleted" };
                         }
                         else if (path.StartsWith("/v1/artifacts/", StringComparison.Ordinal))
@@ -334,6 +354,8 @@ public sealed class VisualTransportTests
                             "\r\nContent-Length: " + raw.Length + "\r\n" + extra + "\r\n");
                         await stream.WriteAsync(response, 0, response.Length);
                         await stream.WriteAsync(raw, 0, raw.Length);
+                        if (method == "GET" && path == "/v1/jobs/" + _job)
+                            JobPolled.TrySetResult(true);
                         if (path == "/v1/jobs" && status == 202) Admitted.TrySetResult(true);
                     }
                 }
